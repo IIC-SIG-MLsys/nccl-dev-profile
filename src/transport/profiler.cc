@@ -58,7 +58,7 @@ static FILE* ncclPrimProfileGetFile() {
         fseek(ncclPrimProfileFile, 0, SEEK_END);
         long fileSize = ftell(ncclPrimProfileFile);
         if (fileSize == 0) {
-          fprintf(ncclPrimProfileFile, "type,channel,work,tb_cycles,prim_cycles_total,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,stop_clk\n");
+          fprintf(ncclPrimProfileFile, "type,channel,work,tb_cycles,prim_cycles_total,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,stop_clk,trace_seq,trace_start,trace_stop,trace_dur,trace_start_off,trace_stop_off,trace_dropped\n");
         }
         fflush(ncclPrimProfileFile);
       }
@@ -98,16 +98,6 @@ static inline void ncclProfilerLogPrimSummary(
        (unsigned long long)primCyclesTotal);
 
   FILE* f = ncclPrimProfileGetFile();
-  if (f != nullptr) {
-    std::lock_guard<std::mutex> lock(ncclPrimProfileFileMutex);
-    fprintf(f, "tb,%d,%llu,%llu,%llu,,0,0,0.00,0.00,%llu,%llu\n",
-            sub->channelId,
-            (unsigned long long)sub->base,
-            (unsigned long long)tbCycles,
-            (unsigned long long)primCyclesTotal,
-            (unsigned long long)startClk,
-            (unsigned long long)stopClk);
-  }
 
   for (int p = 0; p < ncclPrimN; p++) {
     if (stopRec->primCycles[p] == 0) continue;
@@ -123,9 +113,23 @@ static inline void ncclProfilerLogPrimSummary(
          pctTb,
          pctPrim);
 
-    if (f != nullptr) {
-      std::lock_guard<std::mutex> lock(ncclPrimProfileFileMutex);
-      fprintf(f, "prim,%d,%llu,%llu,%llu,%s,%llu,%u,%.6f,%.6f,%llu,%llu\n",
+  }
+  if (f != nullptr) {
+    std::lock_guard<std::mutex> lock(ncclPrimProfileFileMutex);
+    fprintf(f, "tb,%d,%llu,%llu,%llu,,0,0,0.00,0.00,%llu,%llu,,,,,,%u\n",
+            sub->channelId,
+            (unsigned long long)sub->base,
+            (unsigned long long)tbCycles,
+            (unsigned long long)primCyclesTotal,
+            (unsigned long long)startClk,
+            (unsigned long long)stopClk,
+            stopRec->primTraceDropped);
+
+    for (int p = 0; p < ncclPrimN; p++) {
+      if (stopRec->primCycles[p] == 0) continue;
+      double pctTb = 100.0 * (double)stopRec->primCycles[p] / (double)tbCycles;
+      double pctPrim = (primCyclesTotal == 0) ? 0.0 : (100.0 * (double)stopRec->primCycles[p] / (double)primCyclesTotal);
+      fprintf(f, "prim,%d,%llu,%llu,%llu,%s,%llu,%u,%.6f,%.6f,%llu,%llu,,,,,,%u\n",
               sub->channelId,
               (unsigned long long)sub->base,
               (unsigned long long)tbCycles,
@@ -136,11 +140,36 @@ static inline void ncclProfilerLogPrimSummary(
               pctTb,
               pctPrim,
               (unsigned long long)startClk,
-              (unsigned long long)stopClk);
+              (unsigned long long)stopClk,
+              stopRec->primTraceDropped);
     }
-  }
-  if (f != nullptr) {
-    std::lock_guard<std::mutex> lock(ncclPrimProfileFileMutex);
+
+    for (uint32_t t = 0; t < stopRec->primTraceCount && t < NCCL_PRIM_TRACE_MAX_PER_WORK; t++) {
+      struct ncclDevPrimTraceEvent const* ev = &stopRec->primTrace[t];
+      if (ev->stop <= ev->start) continue;
+      if (ev->kind >= ncclPrimN) continue;
+      uint64_t dur = ev->stop - ev->start;
+      int64_t offStart = (int64_t)ev->start - (int64_t)startClk;
+      int64_t offStop = (int64_t)ev->stop - (int64_t)startClk;
+      double pctTb = 100.0 * (double)dur / (double)tbCycles;
+      fprintf(f, "trace,%d,%llu,%llu,%llu,%s,%llu,1,%.6f,0.000000,%llu,%llu,%u,%llu,%llu,%llu,%lld,%lld,%u\n",
+              sub->channelId,
+              (unsigned long long)sub->base,
+              (unsigned long long)tbCycles,
+              (unsigned long long)primCyclesTotal,
+              ncclPrimProfileName[ev->kind],
+              (unsigned long long)dur,
+              pctTb,
+              (unsigned long long)startClk,
+              (unsigned long long)stopClk,
+              ev->seq,
+              (unsigned long long)ev->start,
+              (unsigned long long)ev->stop,
+              (unsigned long long)dur,
+              (long long)offStart,
+              (long long)offStop,
+              stopRec->primTraceDropped);
+    }
     fflush(f);
   }
 }

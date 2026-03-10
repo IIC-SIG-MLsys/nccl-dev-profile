@@ -319,7 +319,8 @@ class Primitives<
       slice += 1;
     }
     if (ncclShmem.profilerEnabled && tid == 0) {
-      ncclPrimProfileAdd((enum ncclPrimProfileKind)PrimKind, globaltimer() - primStart);
+      uint64_t primStop = globaltimer();
+      ncclPrimProfileAdd((enum ncclPrimProfileKind)PrimKind, primStart, primStop);
     }
   }
 

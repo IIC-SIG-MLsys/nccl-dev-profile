@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Analyze NCCL primitive profiling CSV outputs and generate summary tables + plots.
+"""TB-centric analyzer for NCCL primitive profile CSV with timeline visualization.
 
-Input CSV format is produced by NCCL_PRIM_PROFILE_FILE with header:
-  type,channel,work,tb_cycles,prim_cycles_total,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,stop_clk
+Input format (from NCCL_PRIM_PROFILE_FILE):
+  type,channel,work,tb_cycles,prim_cycles_total,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,stop_clk,trace_seq,trace_start,trace_stop,trace_dur,trace_start_off,trace_stop_off,trace_dropped
+
+Supported row types:
+- tb    : one row per TB/work-item summary
+- prim  : one row per TB+primitive aggregate
+- trace : one row per primitive invocation with timing
 """
 
 from __future__ import annotations
@@ -10,22 +15,66 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import math
 import os
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Tuple
 
 
 @dataclass
-class WorkRecord:
+class OpStat:
+    cycles: int = 0
+    calls: int = 0
+
+
+@dataclass
+class TraceEvent:
+    primitive: str
+    seq: int
+    start: int
+    stop: int
+
+    @property
+    def dur(self) -> int:
+        return max(self.stop - self.start, 0)
+
+
+@dataclass
+class TBRecord:
     source: str
     channel: int
     work: int
     tb_cycles: int = 0
-    prim_cycles_total: int = 0
     start_clk: int = 0
     stop_clk: int = 0
+    trace_dropped: int = 0
+    ops: Dict[str, OpStat] = field(default_factory=dict)
+    traces: List[TraceEvent] = field(default_factory=list)
+
+    @property
+    def busy_cycles(self) -> int:
+        # Prefer explicit trace sum when available to reflect ordering rows.
+        if self.traces:
+            return sum(t.dur for t in self.traces)
+        return sum(v.cycles for v in self.ops.values())
+
+    @property
+    def waste_cycles(self) -> int:
+        return max(self.tb_cycles - self.busy_cycles, 0)
+
+    @property
+    def oversub_cycles(self) -> int:
+        return max(self.busy_cycles - self.tb_cycles, 0)
+
+    @property
+    def busy_pct(self) -> float:
+        return (100.0 * self.busy_cycles / self.tb_cycles) if self.tb_cycles > 0 else 0.0
+
+    @property
+    def waste_pct(self) -> float:
+        return (100.0 * self.waste_cycles / self.tb_cycles) if self.tb_cycles > 0 else 0.0
 
 
 def _to_int(v: str) -> int:
@@ -40,170 +89,302 @@ def _to_int(v: str) -> int:
         return 0
 
 
-def _to_float(v: str) -> float:
-    if v is None:
+def percentile(sorted_vals: List[float], p: float) -> float:
+    if not sorted_vals:
         return 0.0
-    s = str(v).strip()
-    if s == "":
-        return 0.0
-    try:
-        return float(s)
-    except ValueError:
-        return 0.0
+    if p <= 0:
+        return sorted_vals[0]
+    if p >= 100:
+        return sorted_vals[-1]
+    idx = (len(sorted_vals) - 1) * (p / 100.0)
+    lo = int(math.floor(idx))
+    hi = int(math.ceil(idx))
+    if lo == hi:
+        return sorted_vals[lo]
+    w = idx - lo
+    return sorted_vals[lo] * (1.0 - w) + sorted_vals[hi] * w
 
 
 def resolve_inputs(patterns: Iterable[str]) -> List[str]:
     paths: List[str] = []
     for p in patterns:
-        matched = sorted(glob.glob(os.path.expanduser(p)))
+        expanded = os.path.expanduser(p)
+        matched = sorted(glob.glob(expanded))
         if matched:
             paths.extend(matched)
-        elif os.path.isfile(p):
-            paths.append(p)
-    # De-dup while preserving order
+        elif os.path.isfile(expanded):
+            paths.append(expanded)
+
     seen = set()
-    out = []
+    uniq: List[str] = []
     for p in paths:
         if p in seen:
             continue
         seen.add(p)
-        out.append(p)
-    return out
+        uniq.append(p)
+    return uniq
 
 
-def load_data(files: List[str]):
-    prim_rows: List[dict] = []
-    works: Dict[Tuple[str, int, int], WorkRecord] = {}
+def load_tb_records(files: List[str]) -> Dict[Tuple[str, int, int], TBRecord]:
+    records: Dict[Tuple[str, int, int], TBRecord] = {}
 
     for src in files:
         with open(src, "r", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 typ = (row.get("type") or "").strip()
-                if typ not in ("tb", "prim"):
+                if typ not in ("tb", "prim", "trace"):
                     continue
 
                 channel = _to_int(row.get("channel", "0"))
                 work = _to_int(row.get("work", "0"))
                 key = (src, channel, work)
 
-                if key not in works:
-                    works[key] = WorkRecord(source=src, channel=channel, work=work)
+                rec = records.get(key)
+                if rec is None:
+                    rec = TBRecord(source=src, channel=channel, work=work)
+                    records[key] = rec
 
-                rec = works[key]
                 tb_cycles = _to_int(row.get("tb_cycles", "0"))
-                prim_cycles_total = _to_int(row.get("prim_cycles_total", "0"))
                 start_clk = _to_int(row.get("start_clk", "0"))
                 stop_clk = _to_int(row.get("stop_clk", "0"))
+                rec.trace_dropped = max(rec.trace_dropped, _to_int(row.get("trace_dropped", "0")))
 
-                rec.tb_cycles = max(rec.tb_cycles, tb_cycles)
-                rec.prim_cycles_total = max(rec.prim_cycles_total, prim_cycles_total)
-                rec.start_clk = rec.start_clk or start_clk
-                rec.stop_clk = max(rec.stop_clk, stop_clk)
+                if tb_cycles > rec.tb_cycles:
+                    rec.tb_cycles = tb_cycles
+                if rec.start_clk == 0 and start_clk > 0:
+                    rec.start_clk = start_clk
+                if stop_clk > rec.stop_clk:
+                    rec.stop_clk = stop_clk
 
                 if typ == "prim":
-                    prim_rows.append(
-                        {
-                            "source": src,
-                            "channel": channel,
-                            "work": work,
-                            "prim": (row.get("prim") or "").strip(),
-                            "cycles": _to_int(row.get("cycles", "0")),
-                            "calls": _to_int(row.get("calls", "0")),
-                            "pct_tb": _to_float(row.get("pct_tb", "0")),
-                            "pct_prim_sum": _to_float(row.get("pct_prim_sum", "0")),
-                            "tb_cycles": tb_cycles,
-                        }
-                    )
+                    prim = (row.get("prim") or "").strip()
+                    if not prim:
+                        continue
+                    st = rec.ops.get(prim)
+                    if st is None:
+                        st = OpStat()
+                        rec.ops[prim] = st
+                    st.cycles += _to_int(row.get("cycles", "0"))
+                    st.calls += _to_int(row.get("calls", "0"))
 
-    return prim_rows, works
+                if typ == "trace":
+                    prim = (row.get("prim") or "").strip()
+                    seq = _to_int(row.get("trace_seq", "0"))
+                    t_start = _to_int(row.get("trace_start", "0"))
+                    t_stop = _to_int(row.get("trace_stop", "0"))
+
+                    # Backward-compatible fallback when trace_* columns are absent.
+                    if t_start == 0:
+                        t_start = start_clk
+                    if t_stop == 0:
+                        t_stop = stop_clk
+
+                    if prim and t_stop > t_start:
+                        rec.traces.append(TraceEvent(primitive=prim, seq=seq, start=t_start, stop=t_stop))
+
+    # Sort traces for each TB by (start, seq)
+    for rec in records.values():
+        rec.traces.sort(key=lambda x: (x.start, x.seq))
+
+        # If tb window missing but traces exist, derive from trace boundaries.
+        if rec.traces and rec.stop_clk <= rec.start_clk:
+            rec.start_clk = rec.traces[0].start
+            rec.stop_clk = rec.traces[-1].stop
+            if rec.tb_cycles <= 0 and rec.stop_clk > rec.start_clk:
+                rec.tb_cycles = rec.stop_clk - rec.start_clk
+
+    return records
 
 
-def summarize(prim_rows: List[dict], works: Dict[Tuple[str, int, int], WorkRecord]):
-    total_tb_cycles = sum(w.tb_cycles for w in works.values())
-    total_prim_cycles = sum(r["cycles"] for r in prim_rows)
+def build_outputs(records: Dict[Tuple[str, int, int], TBRecord]):
+    tbs = list(records.values())
 
-    prim_stats = defaultdict(lambda: {"cycles": 0, "calls": 0, "works": 0})
-    prim_work_seen = defaultdict(set)
+    tb_rows: List[dict] = []
+    tb_op_rows: List[dict] = []
+    tb_trace_rows: List[dict] = []
 
-    for r in prim_rows:
-        p = r["prim"]
-        prim_stats[p]["cycles"] += r["cycles"]
-        prim_stats[p]["calls"] += r["calls"]
-        prim_work_seen[p].add((r["source"], r["channel"], r["work"]))
+    op_agg = defaultdict(lambda: {"cycles": 0, "calls": 0, "tb_hits": 0})
+    ch_agg = defaultdict(lambda: {"tb_count": 0, "tb_cycles": 0, "busy_cycles": 0, "waste_cycles": 0, "oversub_cycles": 0})
+    file_agg = defaultdict(lambda: {"tb_count": 0, "tb_cycles": 0, "busy_cycles": 0, "waste_cycles": 0})
 
-    prim_summary = []
-    for p, s in prim_stats.items():
+    total_tb_cycles = 0
+    total_busy_cycles = 0
+    total_waste_cycles = 0
+    total_oversub_cycles = 0
+
+    for rec in tbs:
+        op_names = sorted(rec.ops.keys())
+        if not op_names and rec.traces:
+            op_names = sorted({t.primitive for t in rec.traces})
+
+        op_count = len(op_names)
+        total_calls = sum(v.calls for v in rec.ops.values())
+
+        row = {
+            "source": rec.source,
+            "source_base": os.path.basename(rec.source),
+            "channel": rec.channel,
+            "work": rec.work,
+            "tb_cycles": rec.tb_cycles,
+            "busy_cycles": rec.busy_cycles,
+            "waste_cycles": rec.waste_cycles,
+            "oversub_cycles": rec.oversub_cycles,
+            "busy_pct": rec.busy_pct,
+            "waste_pct": rec.waste_pct,
+            "operator_count": op_count,
+            "operators": "|".join(op_names),
+            "total_calls": total_calls,
+            "trace_count": len(rec.traces),
+            "trace_dropped": rec.trace_dropped,
+            "start_clk": rec.start_clk,
+            "stop_clk": rec.stop_clk,
+        }
+        tb_rows.append(row)
+
+        total_tb_cycles += rec.tb_cycles
+        total_busy_cycles += rec.busy_cycles
+        total_waste_cycles += rec.waste_cycles
+        total_oversub_cycles += rec.oversub_cycles
+
+        ch = ch_agg[rec.channel]
+        ch["tb_count"] += 1
+        ch["tb_cycles"] += rec.tb_cycles
+        ch["busy_cycles"] += rec.busy_cycles
+        ch["waste_cycles"] += rec.waste_cycles
+        ch["oversub_cycles"] += rec.oversub_cycles
+
+        fa = file_agg[rec.source]
+        fa["tb_count"] += 1
+        fa["tb_cycles"] += rec.tb_cycles
+        fa["busy_cycles"] += rec.busy_cycles
+        fa["waste_cycles"] += rec.waste_cycles
+
+        for prim, st in rec.ops.items():
+            tb_op_rows.append(
+                {
+                    "source": rec.source,
+                    "source_base": os.path.basename(rec.source),
+                    "channel": rec.channel,
+                    "work": rec.work,
+                    "primitive": prim,
+                    "cycles": st.cycles,
+                    "calls": st.calls,
+                    "tb_cycles": rec.tb_cycles,
+                    "pct_tb": (100.0 * st.cycles / rec.tb_cycles) if rec.tb_cycles else 0.0,
+                }
+            )
+            op_agg[prim]["cycles"] += st.cycles
+            op_agg[prim]["calls"] += st.calls
+            op_agg[prim]["tb_hits"] += 1
+
+        # If there are traces but prim rows are absent, aggregate ops from trace for operator summary.
+        if rec.traces and not rec.ops:
+            tmp = defaultdict(int)
+            for t in rec.traces:
+                tmp[t.primitive] += t.dur
+            for prim, cyc in tmp.items():
+                op_agg[prim]["cycles"] += cyc
+                op_agg[prim]["tb_hits"] += 1
+
+        for t in rec.traces:
+            tb_trace_rows.append(
+                {
+                    "source": rec.source,
+                    "source_base": os.path.basename(rec.source),
+                    "channel": rec.channel,
+                    "work": rec.work,
+                    "tb_start_clk": rec.start_clk,
+                    "tb_stop_clk": rec.stop_clk,
+                    "tb_cycles": rec.tb_cycles,
+                    "primitive": t.primitive,
+                    "seq": t.seq,
+                    "trace_start": t.start,
+                    "trace_stop": t.stop,
+                    "trace_dur": t.dur,
+                    "start_off": t.start - rec.start_clk,
+                    "stop_off": t.stop - rec.start_clk,
+                    "pct_tb": (100.0 * t.dur / rec.tb_cycles) if rec.tb_cycles else 0.0,
+                }
+            )
+
+    tb_rows.sort(key=lambda x: (x["waste_cycles"], x["tb_cycles"]), reverse=True)
+
+    op_rows = []
+    for prim, s in op_agg.items():
         cycles = s["cycles"]
         calls = s["calls"]
-        works_hit = len(prim_work_seen[p])
-        prim_summary.append(
+        op_rows.append(
             {
-                "primitive": p,
+                "primitive": prim,
                 "total_cycles": cycles,
                 "total_calls": calls,
+                "tb_hits": s["tb_hits"],
                 "avg_cycles_per_call": (cycles / calls) if calls else 0.0,
-                "work_items": works_hit,
-                "pct_of_prim_cycles": (100.0 * cycles / total_prim_cycles) if total_prim_cycles else 0.0,
+                "avg_cycles_per_tb_hit": (cycles / s["tb_hits"]) if s["tb_hits"] else 0.0,
+                "pct_of_busy_cycles": (100.0 * cycles / total_busy_cycles) if total_busy_cycles else 0.0,
                 "pct_of_tb_cycles": (100.0 * cycles / total_tb_cycles) if total_tb_cycles else 0.0,
             }
         )
+    op_rows.sort(key=lambda x: x["total_cycles"], reverse=True)
 
-    prim_summary.sort(key=lambda x: x["total_cycles"], reverse=True)
-
-    channel_stats = defaultdict(lambda: {"tb_cycles": 0, "prim_cycles_total": 0, "works": 0})
-    for w in works.values():
-        channel_stats[w.channel]["tb_cycles"] += w.tb_cycles
-        channel_stats[w.channel]["prim_cycles_total"] += w.prim_cycles_total
-        channel_stats[w.channel]["works"] += 1
-
-    channel_summary = []
-    for ch, s in sorted(channel_stats.items()):
-        tb = s["tb_cycles"]
-        prim = s["prim_cycles_total"]
-        channel_summary.append(
+    ch_rows = []
+    for ch in sorted(ch_agg.keys()):
+        s = ch_agg[ch]
+        ch_rows.append(
             {
                 "channel": ch,
-                "work_items": s["works"],
-                "tb_cycles": tb,
-                "prim_cycles_total": prim,
-                "prim_over_tb_pct": (100.0 * prim / tb) if tb else 0.0,
+                "tb_count": s["tb_count"],
+                "tb_cycles": s["tb_cycles"],
+                "busy_cycles": s["busy_cycles"],
+                "waste_cycles": s["waste_cycles"],
+                "oversub_cycles": s["oversub_cycles"],
+                "busy_pct": (100.0 * s["busy_cycles"] / s["tb_cycles"]) if s["tb_cycles"] else 0.0,
+                "waste_pct": (100.0 * s["waste_cycles"] / s["tb_cycles"]) if s["tb_cycles"] else 0.0,
             }
         )
 
-    file_stats = defaultdict(lambda: {"tb_cycles": 0, "works": 0, "prim_rows": 0, "prim_cycles": 0})
-    for w in works.values():
-        file_stats[w.source]["tb_cycles"] += w.tb_cycles
-        file_stats[w.source]["works"] += 1
-    for r in prim_rows:
-        file_stats[r["source"]]["prim_rows"] += 1
-        file_stats[r["source"]]["prim_cycles"] += r["cycles"]
-
-    file_summary = []
-    for src in sorted(file_stats.keys()):
-        s = file_stats[src]
-        file_summary.append(
+    file_rows = []
+    for src in sorted(file_agg.keys()):
+        s = file_agg[src]
+        file_rows.append(
             {
                 "source": src,
-                "work_items": s["works"],
+                "source_base": os.path.basename(src),
+                "tb_count": s["tb_count"],
                 "tb_cycles": s["tb_cycles"],
-                "prim_rows": s["prim_rows"],
-                "prim_cycles": s["prim_cycles"],
+                "busy_cycles": s["busy_cycles"],
+                "waste_cycles": s["waste_cycles"],
+                "busy_pct": (100.0 * s["busy_cycles"] / s["tb_cycles"]) if s["tb_cycles"] else 0.0,
+                "waste_pct": (100.0 * s["waste_cycles"] / s["tb_cycles"]) if s["tb_cycles"] else 0.0,
             }
         )
 
-    top_works = sorted(works.values(), key=lambda w: w.tb_cycles, reverse=True)
+    busy_pct_vals = sorted([x["busy_pct"] for x in tb_rows if x["tb_cycles"] > 0])
+    waste_pct_vals = sorted([x["waste_pct"] for x in tb_rows if x["tb_cycles"] > 0])
 
     global_summary = {
-        "files": len(file_summary),
-        "work_items": len(works),
-        "prim_rows": len(prim_rows),
+        "files": len(file_rows),
+        "tb_count": len(tb_rows),
+        "tb_with_ops": sum(1 for x in tb_rows if x["operator_count"] > 0),
+        "tb_without_ops": sum(1 for x in tb_rows if x["operator_count"] == 0),
+        "tb_with_trace": sum(1 for x in tb_rows if x["trace_count"] > 0),
+        "trace_rows": len(tb_trace_rows),
         "total_tb_cycles": total_tb_cycles,
-        "total_prim_cycles": total_prim_cycles,
-        "prim_over_tb_pct": (100.0 * total_prim_cycles / total_tb_cycles) if total_tb_cycles else 0.0,
+        "total_busy_cycles": total_busy_cycles,
+        "total_waste_cycles": total_waste_cycles,
+        "total_oversub_cycles": total_oversub_cycles,
+        "global_busy_pct": (100.0 * total_busy_cycles / total_tb_cycles) if total_tb_cycles else 0.0,
+        "global_waste_pct": (100.0 * total_waste_cycles / total_tb_cycles) if total_tb_cycles else 0.0,
+        "busy_pct_p50": percentile(busy_pct_vals, 50),
+        "busy_pct_p90": percentile(busy_pct_vals, 90),
+        "busy_pct_p99": percentile(busy_pct_vals, 99),
+        "waste_pct_p50": percentile(waste_pct_vals, 50),
+        "waste_pct_p90": percentile(waste_pct_vals, 90),
+        "waste_pct_p99": percentile(waste_pct_vals, 99),
     }
 
-    return global_summary, prim_summary, channel_summary, file_summary, top_works
+    return global_summary, tb_rows, tb_op_rows, tb_trace_rows, op_rows, ch_rows, file_rows
 
 
 def write_csv(path: str, rows: List[dict], fieldnames: List[str]) -> None:
@@ -214,54 +395,147 @@ def write_csv(path: str, rows: List[dict], fieldnames: List[str]) -> None:
             writer.writerow(r)
 
 
-def try_plot(outdir: str, prim_summary: List[dict], channel_summary: List[dict], topk: int) -> None:
+def _timeline_plot_by_source(outdir: str, records_by_source: Dict[str, List[TBRecord]], topk: int) -> None:
+    import matplotlib.pyplot as plt  # type: ignore
+    import matplotlib.patches as mpatches  # type: ignore
+
+    cmap = plt.get_cmap("tab20")
+
+    for source, tbs in records_by_source.items():
+        tbs = [tb for tb in tbs if tb.traces]
+        if not tbs:
+            continue
+
+        # Sort by tb start so we can inspect execution order directly.
+        tbs.sort(key=lambda x: (x.start_clk if x.start_clk > 0 else x.traces[0].start, x.channel, x.work))
+        tbs = tbs[:topk]
+
+        min_start = min(tb.traces[0].start for tb in tbs)
+        max_stop = max(tb.traces[-1].stop for tb in tbs)
+
+        prims = sorted({tr.primitive for tb in tbs for tr in tb.traces})
+        color_of = {p: cmap(i % 20) for i, p in enumerate(prims)}
+
+        fig_h = max(4, 0.35 * len(tbs) + 1.5)
+        fig, ax = plt.subplots(figsize=(14, fig_h))
+
+        y_labels = []
+        y_ticks = []
+
+        for i, tb in enumerate(tbs):
+            y = i
+            y_labels.append(f"ch{tb.channel}:w{tb.work}")
+            y_ticks.append(y)
+            for tr in tb.traces:
+                x = tr.start - min_start
+                w = tr.dur
+                if w <= 0:
+                    continue
+                ax.broken_barh([(x, w)], (y - 0.35, 0.7), facecolors=color_of[tr.primitive], edgecolors="none")
+
+        ax.set_yticks(y_ticks)
+        ax.set_yticklabels(y_labels)
+        ax.set_xlabel("GPU clock offset (ticks)")
+        ax.set_ylabel("TB (channel:work)")
+        ax.set_title(f"TB primitive timeline ({os.path.basename(source)}), showing first {len(tbs)} TBs")
+        ax.set_xlim(0, max_stop - min_start)
+        ax.grid(axis="x", linestyle=":", alpha=0.4)
+
+        handles = [mpatches.Patch(color=color_of[p], label=p) for p in prims[:20]]
+        if handles:
+            ax.legend(handles=handles, loc="upper right", fontsize=8, ncol=1)
+
+        fig.tight_layout()
+        out = os.path.join(outdir, f"tb_timeline_{os.path.basename(source)}.png")
+        fig.savefig(out, dpi=160)
+        plt.close(fig)
+
+
+def try_plot(outdir: str, records: Dict[Tuple[str, int, int], TBRecord], tb_rows: List[dict], op_rows: List[dict], ch_rows: List[dict], topk: int) -> None:
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except Exception as e:
         print(f"[WARN] matplotlib not available, skip plots: {e}")
         return
 
-    top = prim_summary[:topk]
-    if top:
-        names = [x["primitive"] for x in top][::-1]
-        cycles = [x["total_cycles"] for x in top][::-1]
-        pct_tb = [x["pct_of_tb_cycles"] for x in top][::-1]
-
-        fig, ax = plt.subplots(figsize=(10, max(4, len(top) * 0.35)))
-        ax.barh(names, cycles)
-        ax.set_xlabel("Total cycles")
-        ax.set_title(f"Top {len(top)} primitives by cycles")
+    # 1) Histogram of TB busy ratio
+    busy_vals = [x["busy_pct"] for x in tb_rows if x["tb_cycles"] > 0]
+    if busy_vals:
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.hist(busy_vals, bins=30)
+        ax.set_xlabel("TB busy ratio (%)")
+        ax.set_ylabel("TB count")
+        ax.set_title("TB busy ratio distribution")
         fig.tight_layout()
-        fig.savefig(os.path.join(outdir, "prim_total_cycles_topk.png"), dpi=150)
+        fig.savefig(os.path.join(outdir, "tb_busy_ratio_hist.png"), dpi=150)
         plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(10, max(4, len(top) * 0.35)))
-        ax.barh(names, pct_tb)
-        ax.set_xlabel("Pct of TB cycles (%)")
-        ax.set_title(f"Top {len(top)} primitives by TB occupancy")
-        fig.tight_layout()
-        fig.savefig(os.path.join(outdir, "prim_pct_tb_topk.png"), dpi=150)
-        plt.close(fig)
+    # 2) Channel-level stacked busy vs waste
+    if ch_rows:
+        channels = [str(x["channel"]) for x in ch_rows]
+        busy = [x["busy_cycles"] for x in ch_rows]
+        waste = [x["waste_cycles"] for x in ch_rows]
 
-    if channel_summary:
-        ch = [str(x["channel"]) for x in channel_summary]
-        tb = [x["tb_cycles"] for x in channel_summary]
-        prim = [x["prim_cycles_total"] for x in channel_summary]
-
-        fig, ax = plt.subplots(figsize=(10, 4.5))
-        ax.bar(ch, tb, label="tb_cycles")
-        ax.bar(ch, prim, label="prim_cycles_total")
+        fig, ax = plt.subplots(figsize=(10, 4.8))
+        ax.bar(channels, busy, label="busy_cycles")
+        ax.bar(channels, waste, bottom=busy, label="waste_cycles")
         ax.set_xlabel("Channel")
         ax.set_ylabel("Cycles")
-        ax.set_title("TB cycles vs primitive cycles by channel")
+        ax.set_title("Channel TB lifecycle: busy vs waste")
         ax.legend()
         fig.tight_layout()
-        fig.savefig(os.path.join(outdir, "channel_tb_vs_prim_cycles.png"), dpi=150)
+        fig.savefig(os.path.join(outdir, "channel_busy_waste_stacked.png"), dpi=150)
         plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(10, 4.8))
+        ax.bar(channels, [x["waste_pct"] for x in ch_rows])
+        ax.set_xlabel("Channel")
+        ax.set_ylabel("Waste pct (%)")
+        ax.set_title("Channel waste ratio")
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "channel_waste_pct.png"), dpi=150)
+        plt.close(fig)
+
+    # 3) Top-K TBs by waste cycles
+    top_tb = sorted(tb_rows, key=lambda x: x["waste_cycles"], reverse=True)[:topk]
+    if top_tb:
+        labels = [f"{x['source_base']}:{x['channel']}:{x['work']}" for x in top_tb][::-1]
+        waste = [x["waste_cycles"] for x in top_tb][::-1]
+        busy = [x["busy_cycles"] for x in top_tb][::-1]
+
+        fig, ax = plt.subplots(figsize=(12, max(4, 0.35 * len(top_tb))))
+        ax.barh(labels, busy, label="busy_cycles")
+        ax.barh(labels, waste, left=busy, label="waste_cycles")
+        ax.set_xlabel("Cycles")
+        ax.set_title(f"Top {len(top_tb)} TBs by waste")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "tb_topk_waste_stacked.png"), dpi=150)
+        plt.close(fig)
+
+    # 4) Top-K operators by contribution
+    top_op = op_rows[:topk]
+    if top_op:
+        names = [x["primitive"] for x in top_op][::-1]
+        vals = [x["pct_of_busy_cycles"] for x in top_op][::-1]
+
+        fig, ax = plt.subplots(figsize=(10, max(4, 0.35 * len(top_op))))
+        ax.barh(names, vals)
+        ax.set_xlabel("Pct of busy cycles (%)")
+        ax.set_title(f"Top {len(top_op)} operators by busy-cycle contribution")
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "operator_busy_contrib_topk.png"), dpi=150)
+        plt.close(fig)
+
+    # 5) Timeline by source/rank
+    records_by_source: Dict[str, List[TBRecord]] = defaultdict(list)
+    for rec in records.values():
+        records_by_source[rec.source].append(rec)
+    _timeline_plot_by_source(outdir, records_by_source, topk)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Analyze NCCL primitive profile CSV files")
+    parser = argparse.ArgumentParser(description="TB-centric NCCL primitive profile analyzer")
     parser.add_argument(
         "--input",
         nargs="+",
@@ -269,8 +543,8 @@ def main() -> int:
         help="Input CSV files or glob patterns, e.g. /tmp/nccl_prim_profile_rank*.csv",
     )
     parser.add_argument("--outdir", default="prim_profile_report", help="Output directory")
-    parser.add_argument("--topk", type=int, default=20, help="Top-K primitives to plot")
-    parser.add_argument("--no-plots", action="store_true", help="Do not generate PNG plots")
+    parser.add_argument("--topk", type=int, default=30, help="Top-K bars/TBs for plots")
+    parser.add_argument("--no-plots", action="store_true", help="Disable PNG plot generation")
     args = parser.parse_args()
 
     files = resolve_inputs(args.input)
@@ -280,47 +554,114 @@ def main() -> int:
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    prim_rows, works = load_data(files)
-    global_summary, prim_summary, channel_summary, file_summary, top_works = summarize(prim_rows, works)
+    records = load_tb_records(files)
+    global_summary, tb_rows, tb_op_rows, tb_trace_rows, op_rows, ch_rows, file_rows = build_outputs(records)
 
     write_csv(
-        os.path.join(args.outdir, "summary_primitives.csv"),
-        prim_summary,
+        os.path.join(args.outdir, "tb_breakdown.csv"),
+        tb_rows,
+        [
+            "source",
+            "source_base",
+            "channel",
+            "work",
+            "tb_cycles",
+            "busy_cycles",
+            "waste_cycles",
+            "oversub_cycles",
+            "busy_pct",
+            "waste_pct",
+            "operator_count",
+            "operators",
+            "total_calls",
+            "trace_count",
+            "trace_dropped",
+            "start_clk",
+            "stop_clk",
+        ],
+    )
+
+    write_csv(
+        os.path.join(args.outdir, "tb_operator_rows.csv"),
+        tb_op_rows,
+        [
+            "source",
+            "source_base",
+            "channel",
+            "work",
+            "primitive",
+            "cycles",
+            "calls",
+            "tb_cycles",
+            "pct_tb",
+        ],
+    )
+
+    write_csv(
+        os.path.join(args.outdir, "tb_trace_rows.csv"),
+        tb_trace_rows,
+        [
+            "source",
+            "source_base",
+            "channel",
+            "work",
+            "tb_start_clk",
+            "tb_stop_clk",
+            "tb_cycles",
+            "primitive",
+            "seq",
+            "trace_start",
+            "trace_stop",
+            "trace_dur",
+            "start_off",
+            "stop_off",
+            "pct_tb",
+        ],
+    )
+
+    write_csv(
+        os.path.join(args.outdir, "summary_operators.csv"),
+        op_rows,
         [
             "primitive",
             "total_cycles",
             "total_calls",
+            "tb_hits",
             "avg_cycles_per_call",
-            "work_items",
-            "pct_of_prim_cycles",
+            "avg_cycles_per_tb_hit",
+            "pct_of_busy_cycles",
             "pct_of_tb_cycles",
         ],
     )
+
     write_csv(
         os.path.join(args.outdir, "summary_channels.csv"),
-        channel_summary,
-        ["channel", "work_items", "tb_cycles", "prim_cycles_total", "prim_over_tb_pct"],
+        ch_rows,
+        [
+            "channel",
+            "tb_count",
+            "tb_cycles",
+            "busy_cycles",
+            "waste_cycles",
+            "oversub_cycles",
+            "busy_pct",
+            "waste_pct",
+        ],
     )
+
     write_csv(
         os.path.join(args.outdir, "summary_files.csv"),
-        file_summary,
-        ["source", "work_items", "tb_cycles", "prim_rows", "prim_cycles"],
-    )
-    write_csv(
-        os.path.join(args.outdir, "top_work_items.csv"),
+        file_rows,
         [
-            {
-                "source": w.source,
-                "channel": w.channel,
-                "work": w.work,
-                "tb_cycles": w.tb_cycles,
-                "prim_cycles_total": w.prim_cycles_total,
-                "start_clk": w.start_clk,
-                "stop_clk": w.stop_clk,
-            }
-            for w in top_works[:200]
+            "source",
+            "source_base",
+            "tb_count",
+            "tb_cycles",
+            "busy_cycles",
+            "waste_cycles",
+            "busy_pct",
+            "waste_pct",
         ],
-        ["source", "channel", "work", "tb_cycles", "prim_cycles_total", "start_clk", "stop_clk"],
     )
 
     with open(os.path.join(args.outdir, "summary_global.txt"), "w") as f:
@@ -328,15 +669,17 @@ def main() -> int:
             f.write(f"{k}: {v}\n")
 
     if not args.no_plots:
-        try_plot(args.outdir, prim_summary, channel_summary, args.topk)
+        try_plot(args.outdir, records, tb_rows, op_rows, ch_rows, args.topk)
 
     print("[OK] Input files:", len(files))
     print("[OK] Output dir:", os.path.abspath(args.outdir))
-    print("[OK] Work items:", global_summary["work_items"])
-    print("[OK] Primitive rows:", global_summary["prim_rows"])
+    print("[OK] TB count:", global_summary["tb_count"])
+    print("[OK] TB with trace:", global_summary["tb_with_trace"])
+    print("[OK] Trace rows:", global_summary["trace_rows"])
     print("[OK] Total TB cycles:", global_summary["total_tb_cycles"])
-    print("[OK] Total primitive cycles:", global_summary["total_prim_cycles"])
-    print("[OK] Primitive/TB (%):", f"{global_summary['prim_over_tb_pct']:.4f}")
+    print("[OK] Total busy cycles:", global_summary["total_busy_cycles"])
+    print("[OK] Total waste cycles:", global_summary["total_waste_cycles"])
+    print("[OK] Global busy/waste (%):", f"{global_summary['global_busy_pct']:.4f}/{global_summary['global_waste_pct']:.4f}")
     return 0
 
 

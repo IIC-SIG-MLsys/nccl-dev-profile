@@ -423,6 +423,7 @@ struct alignas(16) ncclDevChannel {
 };
 
 #define MAX_PROFILER_EVENTS_PER_CHANNEL 64
+#define NCCL_PRIM_TRACE_MAX_PER_WORK 64
 enum ncclPrimProfileKind : uint8_t {
   ncclPrimSend = 0,
   ncclPrimSendFromOutput,
@@ -452,6 +453,15 @@ enum ncclPrimProfileKind : uint8_t {
   ncclPrimN,
 };
 
+struct ncclDevPrimTraceEvent {
+  uint8_t kind;
+  uint8_t reserved0;
+  uint16_t reserved1;
+  uint32_t seq;
+  uint64_t start;
+  uint64_t stop;
+};
+
 struct ncclDevProfilerRecord {
   uint64_t counter;
   uint64_t timestamp;
@@ -459,6 +469,9 @@ struct ncclDevProfilerRecord {
   uint64_t tbStop;
   uint64_t primCycles[ncclPrimN];
   uint32_t primCalls[ncclPrimN];
+  uint32_t primTraceCount;
+  uint32_t primTraceDropped;
+  struct ncclDevPrimTraceEvent primTrace[NCCL_PRIM_TRACE_MAX_PER_WORK];
 };
 
 struct ncclDevProfiler {
