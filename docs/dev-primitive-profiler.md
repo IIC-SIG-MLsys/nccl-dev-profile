@@ -80,6 +80,23 @@ When `NCCL_DEBUG=INFO` and `NCCL_DEBUG_SUBSYS=PROFILE` are enabled, profiler als
 
 ## Quick Analysis Examples
 
+Use the built-in post-processing script:
+
+```bash
+python3 tools/nccl_prim_profile_report.py \
+  --input /tmp/nccl_prim_profile_rank*.csv \
+  --outdir /tmp/nccl_prim_report
+```
+
+Outputs include:
+
+- `summary_global.txt`
+- `summary_primitives.csv`
+- `summary_channels.csv`
+- `summary_files.csv`
+- `top_work_items.csv`
+- PNG plots (if `matplotlib` is installed)
+
 Aggregate total primitive cycles from CSV:
 
 ```bash
@@ -111,4 +128,3 @@ END {for (k in sum) printf "%s,%.4f%%\n", k, 100.0*sum[k]/total}
 - `src/device/prims_simple.h`
 - `src/transport/profiler.cc`
 - `src/plugin/profiler.cc`
-

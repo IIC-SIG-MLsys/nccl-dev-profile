@@ -67,21 +67,34 @@ static FILE* ncclPrimProfileGetFile() {
   return ncclPrimProfileFile;
 }
 
-static inline void ncclProfilerLogPrimSummary(const struct ncclProxySubArgs* sub, const struct ncclDevProfilerRecord* rec) {
+static inline void ncclProfilerLogPrimSummary(
+    const struct ncclProxySubArgs* sub,
+    const struct ncclDevProfilerRecord* startRec,
+    const struct ncclDevProfilerRecord* stopRec
+  ) {
   if (!ncclPrimProfileEnabled()) return;
-  if (rec->counter < sub->base || rec->tbStop <= rec->tbStart) return;
+  if (stopRec->counter < sub->base) return;
 
-  uint64_t tbCycles = rec->tbStop - rec->tbStart;
+  uint64_t startClk = stopRec->tbStart;
+  uint64_t stopClk = stopRec->tbStop;
+  if (stopClk <= startClk) {
+    // Fallback path for workloads where per-work tbStart/tbStop is not explicitly populated.
+    startClk = startRec->timestamp;
+    stopClk = stopRec->timestamp;
+  }
+  if (stopClk <= startClk) return;
+
+  uint64_t tbCycles = stopClk - startClk;
   uint64_t primCyclesTotal = 0;
-  for (int p = 0; p < ncclPrimN; p++) primCyclesTotal += rec->primCycles[p];
+  for (int p = 0; p < ncclPrimN; p++) primCyclesTotal += stopRec->primCycles[p];
 
   INFO(NCCL_PROFILE,
        "PRIMPROF channel %d work %llu tb_cycles %llu start_clk %llu stop_clk %llu prim_cycles_total %llu",
        sub->channelId,
        (unsigned long long)sub->base,
        (unsigned long long)tbCycles,
-       (unsigned long long)rec->tbStart,
-       (unsigned long long)rec->tbStop,
+       (unsigned long long)startClk,
+       (unsigned long long)stopClk,
        (unsigned long long)primCyclesTotal);
 
   FILE* f = ncclPrimProfileGetFile();
@@ -92,21 +105,21 @@ static inline void ncclProfilerLogPrimSummary(const struct ncclProxySubArgs* sub
             (unsigned long long)sub->base,
             (unsigned long long)tbCycles,
             (unsigned long long)primCyclesTotal,
-            (unsigned long long)rec->tbStart,
-            (unsigned long long)rec->tbStop);
+            (unsigned long long)startClk,
+            (unsigned long long)stopClk);
   }
 
   for (int p = 0; p < ncclPrimN; p++) {
-    if (rec->primCycles[p] == 0) continue;
-    double pctTb = 100.0 * (double)rec->primCycles[p] / (double)tbCycles;
-    double pctPrim = (primCyclesTotal == 0) ? 0.0 : (100.0 * (double)rec->primCycles[p] / (double)primCyclesTotal);
+    if (stopRec->primCycles[p] == 0) continue;
+    double pctTb = 100.0 * (double)stopRec->primCycles[p] / (double)tbCycles;
+    double pctPrim = (primCyclesTotal == 0) ? 0.0 : (100.0 * (double)stopRec->primCycles[p] / (double)primCyclesTotal);
     INFO(NCCL_PROFILE,
          "PRIMPROF channel %d work %llu prim %s cycles %llu calls %u pct_tb %.2f pct_prim_sum %.2f",
          sub->channelId,
          (unsigned long long)sub->base,
          ncclPrimProfileName[p],
-         (unsigned long long)rec->primCycles[p],
-         rec->primCalls[p],
+         (unsigned long long)stopRec->primCycles[p],
+         stopRec->primCalls[p],
          pctTb,
          pctPrim);
 
@@ -118,12 +131,12 @@ static inline void ncclProfilerLogPrimSummary(const struct ncclProxySubArgs* sub
               (unsigned long long)tbCycles,
               (unsigned long long)primCyclesTotal,
               ncclPrimProfileName[p],
-              (unsigned long long)rec->primCycles[p],
-              rec->primCalls[p],
+              (unsigned long long)stopRec->primCycles[p],
+              stopRec->primCalls[p],
               pctTb,
               pctPrim,
-              (unsigned long long)rec->tbStart,
-              (unsigned long long)rec->tbStop);
+              (unsigned long long)startClk,
+              (unsigned long long)stopClk);
     }
   }
   if (f != nullptr) {
@@ -156,14 +169,15 @@ static ncclResult_t profilerProxyProgress(struct ncclProxyState* proxyState, str
       struct ncclProxySubArgs* sub = args->subs + s;
       struct ncclDevProfiler* workStarted = (struct ncclDevProfiler *)sub->sendbuff;
       struct ncclDevProfiler* workCompleted = (struct ncclDevProfiler *)sub->recvbuff;
-      if (sub->posted < sub->nsteps && sub->base <= workStarted[sub->channelId].data[sub->base%MAX_PROFILER_EVENTS_PER_CHANNEL].counter) {
-        ncclProfilerStartKernelChEvent(args, s, workStarted[sub->channelId].data[sub->base%MAX_PROFILER_EVENTS_PER_CHANNEL].timestamp);
+      int idx = sub->base % MAX_PROFILER_EVENTS_PER_CHANNEL;
+      if (sub->posted < sub->nsteps && sub->base <= workStarted[sub->channelId].data[idx].counter) {
+        ncclProfilerStartKernelChEvent(args, s, workStarted[sub->channelId].data[idx].timestamp);
         sub->posted = sub->nsteps;
         continue; // allow events on every channel to start
       }
-      if (sub->transmitted < sub->nsteps && sub->base <= workCompleted[sub->channelId].data[sub->base%MAX_PROFILER_EVENTS_PER_CHANNEL].counter) {
-        ncclProfilerLogPrimSummary(sub, &workCompleted[sub->channelId].data[sub->base%MAX_PROFILER_EVENTS_PER_CHANNEL]);
-        ncclProfilerStopKernelChEvent(args, s, workCompleted[sub->channelId].data[sub->base%MAX_PROFILER_EVENTS_PER_CHANNEL].timestamp);
+      if (sub->transmitted < sub->nsteps && sub->base <= workCompleted[sub->channelId].data[idx].counter) {
+        ncclProfilerLogPrimSummary(sub, &workStarted[sub->channelId].data[idx], &workCompleted[sub->channelId].data[idx]);
+        ncclProfilerStopKernelChEvent(args, s, workCompleted[sub->channelId].data[idx].timestamp);
         sub->transmitted = sub->nsteps;
         args->done++;
       }
