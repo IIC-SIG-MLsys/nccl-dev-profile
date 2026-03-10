@@ -71,6 +71,12 @@ $ make
 $ ./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
 ```
 
+## Developer Profiling
+
+For device primitive breakdown profiling (TB lifecycle + primitive cycles/calls), see:
+
+- [docs/dev-primitive-profiler.md](docs/dev-primitive-profiler.md)
+
 ## Copyright
 
 All source code and accompanying documentation is copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.

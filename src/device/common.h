@@ -252,6 +252,19 @@ __device__ __forceinline__ unsigned long long int globaltimer() {
   return timer;
 }
 
+__device__ __forceinline__ struct ncclDevProfilerRecord* ncclDevProfilerRecordAt(uint64_t workCounter) {
+  return &ncclShmem.comm.workCompleted[ncclShmem.channelId].data[workCounter % MAX_PROFILER_EVENTS_PER_CHANNEL];
+}
+
+__device__ __forceinline__ void ncclPrimProfileAdd(enum ncclPrimProfileKind kind, uint64_t cycles) {
+  if (!ncclShmem.profilerEnabled || threadIdx.x != 0) return;
+  struct ncclDevProfilerRecord* rec = ncclDevProfilerRecordAt(ncclShmem.workCounter);
+  rec->primCycles[kind] += cycles;
+  rec->primCalls[kind] += 1;
+}
+
+__device__ __forceinline__ bool profilerEnabled(int workItemIdx);
+
 template<ncclFunc_t Fn, typename T, typename RedOp, int Algo, int Proto>
 struct RunWorkColl {
   __device__ void run(int tid, int tn, struct ncclDevWorkColl* work) {
@@ -296,11 +309,31 @@ struct RunWorkBatch {
         struct ncclDevWorkColl* workPrev = (struct ncclDevWorkColl*)(ncclShmem.workStorage + (w-1)*ncclShmem.workSize);
         if (work->nWarps != workPrev->nWarps) __syncthreads();
       }
+      if (tid == 0) {
+        uint64_t wc = ncclShmem.channel.workCounter + 1 + w;
+        ncclShmem.workCounter = wc;
+        ncclShmem.profilerEnabled = profilerEnabled(w);
+        if (ncclShmem.profilerEnabled) {
+          struct ncclDevProfilerRecord* rec = ncclDevProfilerRecordAt(wc);
+          rec->tbStart = globaltimer();
+          rec->tbStop = 0;
+          #pragma unroll
+          for (int p = 0; p < ncclPrimN; p++) {
+            rec->primCycles[p] = 0;
+            rec->primCalls[p] = 0;
+          }
+        }
+      }
+      __syncthreads();
       int subtn = work->nWarps*WARP_SIZE;
       // Coverity reports a possible thread divergence due to not all threads participating in the collective.
       // However, the code ensures that the participation is on a per-warp basis.
       // coverity[device_thread_diverged:FALSE]
       if (tid < subtn) RunWorkColl<Fn, T, RedOp, Algo, Proto>().run(tid, subtn, work);
+      __syncthreads();
+      if (tid == 0 && ncclShmem.profilerEnabled) {
+        ncclDevProfilerRecordAt(ncclShmem.workCounter)->tbStop = globaltimer();
+      }
     }
   }
 };

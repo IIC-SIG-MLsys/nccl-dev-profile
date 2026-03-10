@@ -42,6 +42,7 @@ enum {
 };
 static int profilerPluginStatus = profilerPluginLoadReady;
 static pid_t pid;
+NCCL_PARAM(PrimProfile, "PRIM_PROFILE", 0);
 
 static ncclResult_t ncclProfilerPluginLoad(void) {
   const char* profilerName;
@@ -715,13 +716,21 @@ exit:
 }
 
 bool ncclProfilerNeedsProxy(struct ncclComm* comm, struct ncclProxyOp* op) {
-  bool enabled = ncclProfilerPluginLoaded() && (op->eActivationMask & ncclProfileKernelCh);
+  bool enabled = ncclPrimProfileEnabled() || (ncclProfilerPluginLoaded() && (op->eActivationMask & ncclProfileKernelCh));
   if (enabled && !comm->profiler.initialized) (void)proxyProfilerConnect(comm, op);
   return enabled;
 }
 
 bool ncclProfilerPluginLoaded(void) {
   return (COMPILER_EXPECT(ncclProfiler != NULL, 0));
+}
+
+bool ncclPrimProfileEnabled(void) {
+  return ncclParamPrimProfile() != 0;
+}
+
+bool ncclKernelChProfilingEnabled(int eActivationMask) {
+  return ncclPrimProfileEnabled() || (ncclProfilerPluginLoaded() && (eActivationMask & ncclProfileKernelCh));
 }
 
 ncclResult_t ncclProfilerCallback(void** eHandle, int type, void* pHandle, int64_t pluginId, void* extData) {
@@ -878,4 +887,3 @@ ncclResult_t ncclProfilerStopCeBatchEvent(struct ncclComm* comm, void* ceBatchHa
   }
   return ncclSuccess;
 }
-

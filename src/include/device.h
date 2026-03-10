@@ -423,11 +423,46 @@ struct alignas(16) ncclDevChannel {
 };
 
 #define MAX_PROFILER_EVENTS_PER_CHANNEL 64
+enum ncclPrimProfileKind : uint8_t {
+  ncclPrimSend = 0,
+  ncclPrimSendFromOutput,
+  ncclPrimDirectSend,
+  ncclPrimDirectSendFromOutput,
+  ncclPrimRecv,
+  ncclPrimDirectRecv,
+  ncclPrimDirectRecvCopy,
+  ncclPrimCopySend,
+  ncclPrimDirectCopySend,
+  ncclPrimRecvSend,
+  ncclPrimRecvCopySend,
+  ncclPrimDirectRecvCopyDirectSend,
+  ncclPrimDirectRecvDirectSend,
+  ncclPrimRecvDirectSend,
+  ncclPrimDirectRecvSend,
+  ncclPrimRecvCopyDirectSend,
+  ncclPrimRecvReduceCopy,
+  ncclPrimDirectRecvReduceCopy,
+  ncclPrimRecvReduceSend,
+  ncclPrimDirectRecvReduceSend,
+  ncclPrimRecvReduceDirectSend,
+  ncclPrimDirectRecvReduceDirectSend,
+  ncclPrimRecvReduceCopySend,
+  ncclPrimRecvReduceCopyDirectSend,
+  ncclPrimDirectRecvReduceCopyDirectSend,
+  ncclPrimN,
+};
+
+struct ncclDevProfilerRecord {
+  uint64_t counter;
+  uint64_t timestamp;
+  uint64_t tbStart;
+  uint64_t tbStop;
+  uint64_t primCycles[ncclPrimN];
+  uint32_t primCalls[ncclPrimN];
+};
+
 struct ncclDevProfiler {
-  struct {
-    uint64_t counter;
-    uint64_t timestamp;
-  } data[MAX_PROFILER_EVENTS_PER_CHANNEL];
+  struct ncclDevProfilerRecord data[MAX_PROFILER_EVENTS_PER_CHANNEL];
 };
 
 struct ncclKernelComm {
