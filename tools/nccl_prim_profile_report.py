@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TB-centric analyzer for NCCL primitive profile CSV with timeline visualization.
+"""Analyze NCCL primitive profile CSV with TB and channel-lifecycle views.
 
 Input format (from NCCL_PRIM_PROFILE_FILE):
   type,channel,work,tb_cycles,prim_cycles_total,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,stop_clk,trace_seq,trace_start,trace_stop,trace_dur,trace_start_off,trace_stop_off,trace_dropped
@@ -55,7 +55,6 @@ class TBRecord:
 
     @property
     def busy_cycles(self) -> int:
-        # Prefer explicit trace sum when available to reflect ordering rows.
         if self.traces:
             return sum(t.dur for t in self.traces)
         return sum(v.cycles for v in self.ops.values())
@@ -125,6 +124,24 @@ def resolve_inputs(patterns: Iterable[str]) -> List[str]:
     return uniq
 
 
+def _interval_union_length(intervals: List[Tuple[int, int]]) -> int:
+    if not intervals:
+        return 0
+    ordered = sorted((s, e) for s, e in intervals if e > s)
+    if not ordered:
+        return 0
+    total = 0
+    cur_s, cur_e = ordered[0]
+    for s, e in ordered[1:]:
+        if s > cur_e:
+            total += cur_e - cur_s
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    total += cur_e - cur_s
+    return total
+
+
 def load_tb_records(files: List[str]) -> Dict[Tuple[str, int, int], TBRecord]:
     records: Dict[Tuple[str, int, int], TBRecord] = {}
 
@@ -174,7 +191,6 @@ def load_tb_records(files: List[str]) -> Dict[Tuple[str, int, int], TBRecord]:
                     t_start = _to_int(row.get("trace_start", "0"))
                     t_stop = _to_int(row.get("trace_stop", "0"))
 
-                    # Backward-compatible fallback when trace_* columns are absent.
                     if t_start == 0:
                         t_start = start_clk
                     if t_stop == 0:
@@ -183,11 +199,8 @@ def load_tb_records(files: List[str]) -> Dict[Tuple[str, int, int], TBRecord]:
                     if prim and t_stop > t_start:
                         rec.traces.append(TraceEvent(primitive=prim, seq=seq, start=t_start, stop=t_stop))
 
-    # Sort traces for each TB by (start, seq)
     for rec in records.values():
         rec.traces.sort(key=lambda x: (x.start, x.seq))
-
-        # If tb window missing but traces exist, derive from trace boundaries.
         if rec.traces and rec.stop_clk <= rec.start_clk:
             rec.start_clk = rec.traces[0].start
             rec.stop_clk = rec.traces[-1].stop
@@ -203,10 +216,12 @@ def build_outputs(records: Dict[Tuple[str, int, int], TBRecord]):
     tb_rows: List[dict] = []
     tb_op_rows: List[dict] = []
     tb_trace_rows: List[dict] = []
+    channel_rows: List[dict] = []
+    channel_op_rows: List[dict] = []
 
     op_agg = defaultdict(lambda: {"cycles": 0, "calls": 0, "tb_hits": 0})
-    ch_agg = defaultdict(lambda: {"tb_count": 0, "tb_cycles": 0, "busy_cycles": 0, "waste_cycles": 0, "oversub_cycles": 0})
     file_agg = defaultdict(lambda: {"tb_count": 0, "tb_cycles": 0, "busy_cycles": 0, "waste_cycles": 0})
+    channel_agg: Dict[Tuple[str, int], dict] = {}
 
     total_tb_cycles = 0
     total_busy_cycles = 0
@@ -218,47 +233,71 @@ def build_outputs(records: Dict[Tuple[str, int, int], TBRecord]):
         if not op_names and rec.traces:
             op_names = sorted({t.primitive for t in rec.traces})
 
-        op_count = len(op_names)
         total_calls = sum(v.calls for v in rec.ops.values())
-
-        row = {
-            "source": rec.source,
-            "source_base": os.path.basename(rec.source),
-            "channel": rec.channel,
-            "work": rec.work,
-            "tb_cycles": rec.tb_cycles,
-            "busy_cycles": rec.busy_cycles,
-            "waste_cycles": rec.waste_cycles,
-            "oversub_cycles": rec.oversub_cycles,
-            "busy_pct": rec.busy_pct,
-            "waste_pct": rec.waste_pct,
-            "operator_count": op_count,
-            "operators": "|".join(op_names),
-            "total_calls": total_calls,
-            "trace_count": len(rec.traces),
-            "trace_dropped": rec.trace_dropped,
-            "start_clk": rec.start_clk,
-            "stop_clk": rec.stop_clk,
-        }
-        tb_rows.append(row)
+        tb_rows.append(
+            {
+                "source": rec.source,
+                "source_base": os.path.basename(rec.source),
+                "channel": rec.channel,
+                "work": rec.work,
+                "tb_cycles": rec.tb_cycles,
+                "busy_cycles": rec.busy_cycles,
+                "waste_cycles": rec.waste_cycles,
+                "oversub_cycles": rec.oversub_cycles,
+                "busy_pct": rec.busy_pct,
+                "waste_pct": rec.waste_pct,
+                "operator_count": len(op_names),
+                "operators": "|".join(op_names),
+                "total_calls": total_calls,
+                "trace_count": len(rec.traces),
+                "trace_dropped": rec.trace_dropped,
+                "start_clk": rec.start_clk,
+                "stop_clk": rec.stop_clk,
+            }
+        )
 
         total_tb_cycles += rec.tb_cycles
         total_busy_cycles += rec.busy_cycles
         total_waste_cycles += rec.waste_cycles
         total_oversub_cycles += rec.oversub_cycles
 
-        ch = ch_agg[rec.channel]
-        ch["tb_count"] += 1
-        ch["tb_cycles"] += rec.tb_cycles
-        ch["busy_cycles"] += rec.busy_cycles
-        ch["waste_cycles"] += rec.waste_cycles
-        ch["oversub_cycles"] += rec.oversub_cycles
-
         fa = file_agg[rec.source]
         fa["tb_count"] += 1
         fa["tb_cycles"] += rec.tb_cycles
         fa["busy_cycles"] += rec.busy_cycles
         fa["waste_cycles"] += rec.waste_cycles
+
+        ch_key = (rec.source, rec.channel)
+        ch = channel_agg.get(ch_key)
+        if ch is None:
+            ch = {
+                "source": rec.source,
+                "source_base": os.path.basename(rec.source),
+                "channel": rec.channel,
+                "works": set(),
+                "tb_count": 0,
+                "tb_cycles_sum": 0,
+                "busy_cycles_sum": 0,
+                "start_clk": 0,
+                "stop_clk": 0,
+                "trace_count": 0,
+                "trace_dropped": 0,
+                "trace_intervals": [],
+                "op_cycles": defaultdict(int),
+                "op_calls": defaultdict(int),
+            }
+            channel_agg[ch_key] = ch
+
+        ch["works"].add(rec.work)
+        ch["tb_count"] += 1
+        ch["tb_cycles_sum"] += rec.tb_cycles
+        ch["busy_cycles_sum"] += rec.busy_cycles
+        ch["trace_count"] += len(rec.traces)
+        ch["trace_dropped"] += rec.trace_dropped
+        if rec.start_clk > 0 and (ch["start_clk"] == 0 or rec.start_clk < ch["start_clk"]):
+            ch["start_clk"] = rec.start_clk
+        if rec.stop_clk > ch["stop_clk"]:
+            ch["stop_clk"] = rec.stop_clk
 
         for prim, st in rec.ops.items():
             tb_op_rows.append(
@@ -274,20 +313,27 @@ def build_outputs(records: Dict[Tuple[str, int, int], TBRecord]):
                     "pct_tb": (100.0 * st.cycles / rec.tb_cycles) if rec.tb_cycles else 0.0,
                 }
             )
+            ch["op_cycles"][prim] += st.cycles
+            ch["op_calls"][prim] += st.calls
             op_agg[prim]["cycles"] += st.cycles
             op_agg[prim]["calls"] += st.calls
             op_agg[prim]["tb_hits"] += 1
 
-        # If there are traces but prim rows are absent, aggregate ops from trace for operator summary.
         if rec.traces and not rec.ops:
-            tmp = defaultdict(int)
+            tmp_cycles = defaultdict(int)
+            tmp_calls = defaultdict(int)
             for t in rec.traces:
-                tmp[t.primitive] += t.dur
-            for prim, cyc in tmp.items():
+                tmp_cycles[t.primitive] += t.dur
+                tmp_calls[t.primitive] += 1
+            for prim, cyc in tmp_cycles.items():
+                ch["op_cycles"][prim] += cyc
+                ch["op_calls"][prim] += tmp_calls[prim]
                 op_agg[prim]["cycles"] += cyc
+                op_agg[prim]["calls"] += tmp_calls[prim]
                 op_agg[prim]["tb_hits"] += 1
 
         for t in rec.traces:
+            ch["trace_intervals"].append((t.start, t.stop))
             tb_trace_rows.append(
                 {
                     "source": rec.source,
@@ -310,6 +356,74 @@ def build_outputs(records: Dict[Tuple[str, int, int], TBRecord]):
 
     tb_rows.sort(key=lambda x: (x["waste_cycles"], x["tb_cycles"]), reverse=True)
 
+    total_channel_cycles = 0
+    total_channel_busy_cycles = 0
+    total_channel_waste_cycles = 0
+    total_channel_oversub_cycles = 0
+    channel_busy_pcts: List[float] = []
+    channel_waste_pcts: List[float] = []
+
+    for _, ch in sorted(channel_agg.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        channel_cycles = (ch["stop_clk"] - ch["start_clk"]) if ch["stop_clk"] > ch["start_clk"] else ch["tb_cycles_sum"]
+        busy_union = _interval_union_length(ch["trace_intervals"]) if ch["trace_intervals"] else ch["busy_cycles_sum"]
+        busy_sum = ch["busy_cycles_sum"]
+        waste_cycles = max(channel_cycles - busy_union, 0)
+        oversub_cycles = max(busy_sum - busy_union, 0)
+        busy_pct = (100.0 * busy_union / channel_cycles) if channel_cycles else 0.0
+        waste_pct = (100.0 * waste_cycles / channel_cycles) if channel_cycles else 0.0
+
+        operators = sorted(ch["op_cycles"].keys())
+        channel_rows.append(
+            {
+                "source": ch["source"],
+                "source_base": ch["source_base"],
+                "channel": ch["channel"],
+                "work_count": len(ch["works"]),
+                "tb_count": ch["tb_count"],
+                "channel_start_clk": ch["start_clk"],
+                "channel_stop_clk": ch["stop_clk"],
+                "channel_cycles": channel_cycles,
+                "tb_cycles_sum": ch["tb_cycles_sum"],
+                "busy_cycles": busy_union,
+                "busy_cycles_sum": busy_sum,
+                "waste_cycles": waste_cycles,
+                "oversub_cycles": oversub_cycles,
+                "busy_pct": busy_pct,
+                "waste_pct": waste_pct,
+                "trace_count": ch["trace_count"],
+                "trace_dropped": ch["trace_dropped"],
+                "operator_count": len(operators),
+                "operators": "|".join(operators),
+            }
+        )
+
+        total_channel_cycles += channel_cycles
+        total_channel_busy_cycles += busy_union
+        total_channel_waste_cycles += waste_cycles
+        total_channel_oversub_cycles += oversub_cycles
+        if channel_cycles > 0:
+            channel_busy_pcts.append(busy_pct)
+            channel_waste_pcts.append(waste_pct)
+
+        for prim in operators:
+            cyc = ch["op_cycles"][prim]
+            calls = ch["op_calls"][prim]
+            channel_op_rows.append(
+                {
+                    "source": ch["source"],
+                    "source_base": ch["source_base"],
+                    "channel": ch["channel"],
+                    "primitive": prim,
+                    "cycles": cyc,
+                    "calls": calls,
+                    "pct_channel_busy": (100.0 * cyc / busy_union) if busy_union else 0.0,
+                    "pct_channel_lifecycle": (100.0 * cyc / channel_cycles) if channel_cycles else 0.0,
+                }
+            )
+
+    channel_rows.sort(key=lambda x: (x["waste_cycles"], x["channel_cycles"]), reverse=True)
+    channel_op_rows.sort(key=lambda x: (x["source_base"], x["channel"], -x["cycles"]))
+
     op_rows = []
     for prim, s in op_agg.items():
         cycles = s["cycles"]
@@ -324,25 +438,11 @@ def build_outputs(records: Dict[Tuple[str, int, int], TBRecord]):
                 "avg_cycles_per_tb_hit": (cycles / s["tb_hits"]) if s["tb_hits"] else 0.0,
                 "pct_of_busy_cycles": (100.0 * cycles / total_busy_cycles) if total_busy_cycles else 0.0,
                 "pct_of_tb_cycles": (100.0 * cycles / total_tb_cycles) if total_tb_cycles else 0.0,
+                "pct_of_channel_busy_cycles": (100.0 * cycles / total_channel_busy_cycles) if total_channel_busy_cycles else 0.0,
+                "pct_of_channel_cycles": (100.0 * cycles / total_channel_cycles) if total_channel_cycles else 0.0,
             }
         )
     op_rows.sort(key=lambda x: x["total_cycles"], reverse=True)
-
-    ch_rows = []
-    for ch in sorted(ch_agg.keys()):
-        s = ch_agg[ch]
-        ch_rows.append(
-            {
-                "channel": ch,
-                "tb_count": s["tb_count"],
-                "tb_cycles": s["tb_cycles"],
-                "busy_cycles": s["busy_cycles"],
-                "waste_cycles": s["waste_cycles"],
-                "oversub_cycles": s["oversub_cycles"],
-                "busy_pct": (100.0 * s["busy_cycles"] / s["tb_cycles"]) if s["tb_cycles"] else 0.0,
-                "waste_pct": (100.0 * s["waste_cycles"] / s["tb_cycles"]) if s["tb_cycles"] else 0.0,
-            }
-        )
 
     file_rows = []
     for src in sorted(file_agg.keys()):
@@ -362,10 +462,13 @@ def build_outputs(records: Dict[Tuple[str, int, int], TBRecord]):
 
     busy_pct_vals = sorted([x["busy_pct"] for x in tb_rows if x["tb_cycles"] > 0])
     waste_pct_vals = sorted([x["waste_pct"] for x in tb_rows if x["tb_cycles"] > 0])
+    channel_busy_pcts.sort()
+    channel_waste_pcts.sort()
 
     global_summary = {
         "files": len(file_rows),
         "tb_count": len(tb_rows),
+        "channel_count": len(channel_rows),
         "tb_with_ops": sum(1 for x in tb_rows if x["operator_count"] > 0),
         "tb_without_ops": sum(1 for x in tb_rows if x["operator_count"] == 0),
         "tb_with_trace": sum(1 for x in tb_rows if x["trace_count"] > 0),
@@ -382,9 +485,21 @@ def build_outputs(records: Dict[Tuple[str, int, int], TBRecord]):
         "waste_pct_p50": percentile(waste_pct_vals, 50),
         "waste_pct_p90": percentile(waste_pct_vals, 90),
         "waste_pct_p99": percentile(waste_pct_vals, 99),
+        "total_channel_cycles": total_channel_cycles,
+        "total_channel_busy_cycles": total_channel_busy_cycles,
+        "total_channel_waste_cycles": total_channel_waste_cycles,
+        "total_channel_oversub_cycles": total_channel_oversub_cycles,
+        "global_channel_busy_pct": (100.0 * total_channel_busy_cycles / total_channel_cycles) if total_channel_cycles else 0.0,
+        "global_channel_waste_pct": (100.0 * total_channel_waste_cycles / total_channel_cycles) if total_channel_cycles else 0.0,
+        "channel_busy_pct_p50": percentile(channel_busy_pcts, 50),
+        "channel_busy_pct_p90": percentile(channel_busy_pcts, 90),
+        "channel_busy_pct_p99": percentile(channel_busy_pcts, 99),
+        "channel_waste_pct_p50": percentile(channel_waste_pcts, 50),
+        "channel_waste_pct_p90": percentile(channel_waste_pcts, 90),
+        "channel_waste_pct_p99": percentile(channel_waste_pcts, 99),
     }
 
-    return global_summary, tb_rows, tb_op_rows, tb_trace_rows, op_rows, ch_rows, file_rows
+    return global_summary, tb_rows, tb_op_rows, tb_trace_rows, channel_rows, channel_op_rows, op_rows, file_rows
 
 
 def write_csv(path: str, rows: List[dict], fieldnames: List[str]) -> None:
@@ -395,49 +510,52 @@ def write_csv(path: str, rows: List[dict], fieldnames: List[str]) -> None:
             writer.writerow(r)
 
 
-def _timeline_plot_by_source(outdir: str, records_by_source: Dict[str, List[TBRecord]], topk: int) -> None:
+def _channel_timeline_plot_by_source(outdir: str, records_by_source: Dict[str, List[TBRecord]], topk: int) -> None:
     import matplotlib.pyplot as plt  # type: ignore
     import matplotlib.patches as mpatches  # type: ignore
 
     cmap = plt.get_cmap("tab20")
 
     for source, tbs in records_by_source.items():
-        tbs = [tb for tb in tbs if tb.traces]
-        if not tbs:
+        ch_events: Dict[int, List[Tuple[int, int, str]]] = defaultdict(list)
+        for tb in tbs:
+            for tr in tb.traces:
+                ch_events[tb.channel].append((tr.start, tr.stop, tr.primitive))
+
+        ch_events = {ch: evs for ch, evs in ch_events.items() if evs}
+        if not ch_events:
             continue
 
-        # Sort by tb start so we can inspect execution order directly.
-        tbs.sort(key=lambda x: (x.start_clk if x.start_clk > 0 else x.traces[0].start, x.channel, x.work))
-        tbs = tbs[:topk]
+        channels = sorted(ch_events.keys())
+        if topk > 0 and len(channels) > topk:
+            channels = sorted(
+                channels,
+                key=lambda ch: sum(max(e - s, 0) for s, e, _ in ch_events[ch]),
+                reverse=True,
+            )[:topk]
+            channels.sort()
 
-        min_start = min(tb.traces[0].start for tb in tbs)
-        max_stop = max(tb.traces[-1].stop for tb in tbs)
-
-        prims = sorted({tr.primitive for tb in tbs for tr in tb.traces})
+        min_start = min(s for ch in channels for s, _, _ in ch_events[ch])
+        max_stop = max(e for ch in channels for _, e, _ in ch_events[ch])
+        prims = sorted({p for ch in channels for _, _, p in ch_events[ch]})
         color_of = {p: cmap(i % 20) for i, p in enumerate(prims)}
 
-        fig_h = max(4, 0.35 * len(tbs) + 1.5)
+        fig_h = max(4, 0.45 * len(channels) + 1.5)
         fig, ax = plt.subplots(figsize=(14, fig_h))
 
-        y_labels = []
-        y_ticks = []
-
-        for i, tb in enumerate(tbs):
-            y = i
-            y_labels.append(f"ch{tb.channel}:w{tb.work}")
-            y_ticks.append(y)
-            for tr in tb.traces:
-                x = tr.start - min_start
-                w = tr.dur
-                if w <= 0:
+        for i, ch in enumerate(channels):
+            events = sorted(ch_events[ch], key=lambda x: (x[0], x[1]))
+            for s, e, prim in events:
+                dur = e - s
+                if dur <= 0:
                     continue
-                ax.broken_barh([(x, w)], (y - 0.35, 0.7), facecolors=color_of[tr.primitive], edgecolors="none")
+                ax.broken_barh([(s - min_start, dur)], (i - 0.35, 0.7), facecolors=color_of[prim], edgecolors="none")
 
-        ax.set_yticks(y_ticks)
-        ax.set_yticklabels(y_labels)
+        ax.set_yticks(list(range(len(channels))))
+        ax.set_yticklabels([f"ch{ch}" for ch in channels])
         ax.set_xlabel("GPU clock offset (ticks)")
-        ax.set_ylabel("TB (channel:work)")
-        ax.set_title(f"TB primitive timeline ({os.path.basename(source)}), showing first {len(tbs)} TBs")
+        ax.set_ylabel("Channel (all works merged)")
+        ax.set_title(f"Channel primitive timeline ({os.path.basename(source)})")
         ax.set_xlim(0, max_stop - min_start)
         ax.grid(axis="x", linestyle=":", alpha=0.4)
 
@@ -446,19 +564,25 @@ def _timeline_plot_by_source(outdir: str, records_by_source: Dict[str, List[TBRe
             ax.legend(handles=handles, loc="upper right", fontsize=8, ncol=1)
 
         fig.tight_layout()
-        out = os.path.join(outdir, f"tb_timeline_{os.path.basename(source)}.png")
+        out = os.path.join(outdir, f"channel_timeline_{os.path.basename(source)}.png")
         fig.savefig(out, dpi=160)
         plt.close(fig)
 
 
-def try_plot(outdir: str, records: Dict[Tuple[str, int, int], TBRecord], tb_rows: List[dict], op_rows: List[dict], ch_rows: List[dict], topk: int) -> None:
+def try_plot(
+    outdir: str,
+    records: Dict[Tuple[str, int, int], TBRecord],
+    tb_rows: List[dict],
+    channel_rows: List[dict],
+    op_rows: List[dict],
+    topk: int,
+) -> None:
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except Exception as e:
         print(f"[WARN] matplotlib not available, skip plots: {e}")
         return
 
-    # 1) Histogram of TB busy ratio
     busy_vals = [x["busy_pct"] for x in tb_rows if x["tb_cycles"] > 0]
     if busy_vals:
         fig, ax = plt.subplots(figsize=(8, 4.5))
@@ -470,72 +594,69 @@ def try_plot(outdir: str, records: Dict[Tuple[str, int, int], TBRecord], tb_rows
         fig.savefig(os.path.join(outdir, "tb_busy_ratio_hist.png"), dpi=150)
         plt.close(fig)
 
-    # 2) Channel-level stacked busy vs waste
-    if ch_rows:
-        channels = [str(x["channel"]) for x in ch_rows]
-        busy = [x["busy_cycles"] for x in ch_rows]
-        waste = [x["waste_cycles"] for x in ch_rows]
+    if channel_rows:
+        ch_sorted = sorted(channel_rows, key=lambda x: (x["source_base"], x["channel"]))
+        labels = [f"{x['source_base']}:ch{x['channel']}" for x in ch_sorted]
+        busy = [x["busy_cycles"] for x in ch_sorted]
+        waste = [x["waste_cycles"] for x in ch_sorted]
 
-        fig, ax = plt.subplots(figsize=(10, 4.8))
-        ax.bar(channels, busy, label="busy_cycles")
-        ax.bar(channels, waste, bottom=busy, label="waste_cycles")
-        ax.set_xlabel("Channel")
+        fig, ax = plt.subplots(figsize=(max(10, 0.5 * len(labels)), 4.8))
+        ax.bar(labels, busy, label="busy_cycles")
+        ax.bar(labels, waste, bottom=busy, label="waste_cycles")
+        ax.set_xlabel("Source:Channel")
         ax.set_ylabel("Cycles")
-        ax.set_title("Channel TB lifecycle: busy vs waste")
+        ax.set_title("Channel lifecycle: busy vs waste (works merged)")
         ax.legend()
+        ax.tick_params(axis="x", rotation=60)
         fig.tight_layout()
         fig.savefig(os.path.join(outdir, "channel_busy_waste_stacked.png"), dpi=150)
         plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(10, 4.8))
-        ax.bar(channels, [x["waste_pct"] for x in ch_rows])
-        ax.set_xlabel("Channel")
+        fig, ax = plt.subplots(figsize=(max(10, 0.5 * len(labels)), 4.8))
+        ax.bar(labels, [x["waste_pct"] for x in ch_sorted])
+        ax.set_xlabel("Source:Channel")
         ax.set_ylabel("Waste pct (%)")
-        ax.set_title("Channel waste ratio")
+        ax.set_title("Channel waste ratio (works merged)")
+        ax.tick_params(axis="x", rotation=60)
         fig.tight_layout()
         fig.savefig(os.path.join(outdir, "channel_waste_pct.png"), dpi=150)
         plt.close(fig)
 
-    # 3) Top-K TBs by waste cycles
-    top_tb = sorted(tb_rows, key=lambda x: x["waste_cycles"], reverse=True)[:topk]
-    if top_tb:
-        labels = [f"{x['source_base']}:{x['channel']}:{x['work']}" for x in top_tb][::-1]
-        waste = [x["waste_cycles"] for x in top_tb][::-1]
-        busy = [x["busy_cycles"] for x in top_tb][::-1]
+        top_ch = sorted(channel_rows, key=lambda x: x["waste_cycles"], reverse=True)[:topk]
+        if top_ch:
+            y_labels = [f"{x['source_base']}:ch{x['channel']}" for x in top_ch][::-1]
+            y_busy = [x["busy_cycles"] for x in top_ch][::-1]
+            y_waste = [x["waste_cycles"] for x in top_ch][::-1]
+            fig, ax = plt.subplots(figsize=(12, max(4, 0.35 * len(top_ch))))
+            ax.barh(y_labels, y_busy, label="busy_cycles")
+            ax.barh(y_labels, y_waste, left=y_busy, label="waste_cycles")
+            ax.set_xlabel("Cycles")
+            ax.set_title(f"Top {len(top_ch)} channels by waste")
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(os.path.join(outdir, "channel_topk_waste_stacked.png"), dpi=150)
+            plt.close(fig)
 
-        fig, ax = plt.subplots(figsize=(12, max(4, 0.35 * len(top_tb))))
-        ax.barh(labels, busy, label="busy_cycles")
-        ax.barh(labels, waste, left=busy, label="waste_cycles")
-        ax.set_xlabel("Cycles")
-        ax.set_title(f"Top {len(top_tb)} TBs by waste")
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(os.path.join(outdir, "tb_topk_waste_stacked.png"), dpi=150)
-        plt.close(fig)
-
-    # 4) Top-K operators by contribution
     top_op = op_rows[:topk]
     if top_op:
         names = [x["primitive"] for x in top_op][::-1]
-        vals = [x["pct_of_busy_cycles"] for x in top_op][::-1]
-
+        vals = [x["pct_of_channel_busy_cycles"] for x in top_op][::-1]
         fig, ax = plt.subplots(figsize=(10, max(4, 0.35 * len(top_op))))
         ax.barh(names, vals)
-        ax.set_xlabel("Pct of busy cycles (%)")
+        ax.set_xlabel("Pct of channel busy cycles (%)")
         ax.set_title(f"Top {len(top_op)} operators by busy-cycle contribution")
         fig.tight_layout()
         fig.savefig(os.path.join(outdir, "operator_busy_contrib_topk.png"), dpi=150)
         plt.close(fig)
 
-    # 5) Timeline by source/rank
     records_by_source: Dict[str, List[TBRecord]] = defaultdict(list)
     for rec in records.values():
         records_by_source[rec.source].append(rec)
-    _timeline_plot_by_source(outdir, records_by_source, topk)
+    _channel_timeline_plot_by_source(outdir, records_by_source, topk)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="TB-centric NCCL primitive profile analyzer")
+    parser = argparse.ArgumentParser(description="NCCL primitive profile analyzer")
     parser.add_argument(
         "--input",
         nargs="+",
@@ -543,7 +664,7 @@ def main() -> int:
         help="Input CSV files or glob patterns, e.g. /tmp/nccl_prim_profile_rank*.csv",
     )
     parser.add_argument("--outdir", default="prim_profile_report", help="Output directory")
-    parser.add_argument("--topk", type=int, default=30, help="Top-K bars/TBs for plots")
+    parser.add_argument("--topk", type=int, default=30, help="Top-K rows for ranking plots/channels in timeline")
     parser.add_argument("--no-plots", action="store_true", help="Disable PNG plot generation")
     args = parser.parse_args()
 
@@ -555,7 +676,7 @@ def main() -> int:
     os.makedirs(args.outdir, exist_ok=True)
 
     records = load_tb_records(files)
-    global_summary, tb_rows, tb_op_rows, tb_trace_rows, op_rows, ch_rows, file_rows = build_outputs(records)
+    global_summary, tb_rows, tb_op_rows, tb_trace_rows, channel_rows, channel_op_rows, op_rows, file_rows = build_outputs(records)
 
     write_csv(
         os.path.join(args.outdir, "tb_breakdown.csv"),
@@ -619,6 +740,45 @@ def main() -> int:
         ],
     )
 
+    channel_fields = [
+        "source",
+        "source_base",
+        "channel",
+        "work_count",
+        "tb_count",
+        "channel_start_clk",
+        "channel_stop_clk",
+        "channel_cycles",
+        "tb_cycles_sum",
+        "busy_cycles",
+        "busy_cycles_sum",
+        "waste_cycles",
+        "oversub_cycles",
+        "busy_pct",
+        "waste_pct",
+        "trace_count",
+        "trace_dropped",
+        "operator_count",
+        "operators",
+    ]
+    write_csv(os.path.join(args.outdir, "channel_breakdown.csv"), channel_rows, channel_fields)
+    write_csv(os.path.join(args.outdir, "summary_channels.csv"), channel_rows, channel_fields)
+
+    write_csv(
+        os.path.join(args.outdir, "channel_operator_rows.csv"),
+        channel_op_rows,
+        [
+            "source",
+            "source_base",
+            "channel",
+            "primitive",
+            "cycles",
+            "calls",
+            "pct_channel_busy",
+            "pct_channel_lifecycle",
+        ],
+    )
+
     write_csv(
         os.path.join(args.outdir, "summary_operators.csv"),
         op_rows,
@@ -631,21 +791,8 @@ def main() -> int:
             "avg_cycles_per_tb_hit",
             "pct_of_busy_cycles",
             "pct_of_tb_cycles",
-        ],
-    )
-
-    write_csv(
-        os.path.join(args.outdir, "summary_channels.csv"),
-        ch_rows,
-        [
-            "channel",
-            "tb_count",
-            "tb_cycles",
-            "busy_cycles",
-            "waste_cycles",
-            "oversub_cycles",
-            "busy_pct",
-            "waste_pct",
+            "pct_of_channel_busy_cycles",
+            "pct_of_channel_cycles",
         ],
     )
 
@@ -669,17 +816,21 @@ def main() -> int:
             f.write(f"{k}: {v}\n")
 
     if not args.no_plots:
-        try_plot(args.outdir, records, tb_rows, op_rows, ch_rows, args.topk)
+        try_plot(args.outdir, records, tb_rows, channel_rows, op_rows, args.topk)
 
     print("[OK] Input files:", len(files))
     print("[OK] Output dir:", os.path.abspath(args.outdir))
     print("[OK] TB count:", global_summary["tb_count"])
+    print("[OK] Channel count:", global_summary["channel_count"])
     print("[OK] TB with trace:", global_summary["tb_with_trace"])
     print("[OK] Trace rows:", global_summary["trace_rows"])
-    print("[OK] Total TB cycles:", global_summary["total_tb_cycles"])
-    print("[OK] Total busy cycles:", global_summary["total_busy_cycles"])
-    print("[OK] Total waste cycles:", global_summary["total_waste_cycles"])
-    print("[OK] Global busy/waste (%):", f"{global_summary['global_busy_pct']:.4f}/{global_summary['global_waste_pct']:.4f}")
+    print("[OK] Total channel cycles:", global_summary["total_channel_cycles"])
+    print("[OK] Total channel busy cycles:", global_summary["total_channel_busy_cycles"])
+    print("[OK] Total channel waste cycles:", global_summary["total_channel_waste_cycles"])
+    print(
+        "[OK] Global channel busy/waste (%):",
+        f"{global_summary['global_channel_busy_pct']:.4f}/{global_summary['global_channel_waste_pct']:.4f}",
+    )
     return 0
 
 

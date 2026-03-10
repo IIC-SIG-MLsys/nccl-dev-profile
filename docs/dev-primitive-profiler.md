@@ -100,16 +100,18 @@ Outputs include:
 - `tb_breakdown.csv` (one row per TB/work item)
 - `tb_operator_rows.csv` (one row per TB+operator)
 - `tb_trace_rows.csv` (one row per primitive call; includes in-TB order and timing offsets)
+- `channel_breakdown.csv` (one row per `source+channel`, all works merged)
+- `channel_operator_rows.csv` (one row per `source+channel+operator`)
 - `summary_operators.csv`
-- `summary_channels.csv`
+- `summary_channels.csv` (same content as `channel_breakdown.csv` for compatibility)
 - `summary_files.csv`
 - PNG plots (if `matplotlib` is installed):
   - `tb_busy_ratio_hist.png`
   - `channel_busy_waste_stacked.png`
   - `channel_waste_pct.png`
-  - `tb_topk_waste_stacked.png`
+  - `channel_topk_waste_stacked.png`
   - `operator_busy_contrib_topk.png`
-  - `tb_timeline_<source>.png` (TB-level primitive timeline / ordering)
+  - `channel_timeline_<source>.png` (each row is one channel, all works merged on one axis)
 
 Key TB-level columns in `tb_breakdown.csv`:
 
@@ -119,31 +121,35 @@ Key TB-level columns in `tb_breakdown.csv`:
 - `waste_pct`: waste ratio in TB lifecycle
 - `operators`: operators seen on this TB
 
-This makes it easy to inspect waste directly by sorting:
+Channel-merged lifecycle columns (in `channel_breakdown.csv`):
+
+- `channel_cycles`: channel lifecycle span (`max(stop_clk)-min(start_clk)` over all works in that channel)
+- `busy_cycles`: union of trace durations on the channel timeline
+- `waste_cycles`: `max(channel_cycles - busy_cycles, 0)`
+- `work_count`: number of different `work` ids merged into this channel
+
+This makes it easy to inspect waste directly by channel:
 
 ```bash
-awk -F, 'NR==1{print;next}{print | "sort -t, -k7,7nr"}' /tmp/nccl_prim_report/tb_breakdown.csv | head
+{
+  head -n 1 /tmp/nccl_prim_report/channel_breakdown.csv
+  tail -n +2 /tmp/nccl_prim_report/channel_breakdown.csv | sort -t, -k12,12nr
+} | head
 ```
 
-Inspect per-TB primitive ordering and occupancy:
+Inspect primitive ordering on one channel timeline:
 
 ```bash
-# list the most wasteful TBs first
-{
-  head -n 1 /tmp/nccl_prim_report/tb_breakdown.csv
-  tail -n +2 /tmp/nccl_prim_report/tb_breakdown.csv | sort -t, -k7,7nr
-} | cut -d, -f2,3,4,5,6,7,9 | head -n 20
-
-# inspect one TB's primitive sequence
-awk -F, '$2==0 && $3==123 {print $0}' /tmp/nccl_prim_report/tb_trace_rows.csv | sort -t, -k9,9n
+# inspect one channel (all works mixed) ordered by absolute start time
+awk -F, '$3==0 {print $0}' /tmp/nccl_prim_report/tb_trace_rows.csv | sort -t, -k10,10n
 ```
 
 Interpretation hints:
 
-- For one TB (`channel`,`work` fixed), compare `trace_start`/`trace_stop` across rows to see primitive order and gaps.
-- TB utilization = `sum(trace_dur) / tb_cycles`.
-- TB waste = `tb_cycles - sum(trace_dur)`.
-- `tb_timeline_<source>.png` stacks many TBs together so you can see who starts earlier/later and where gaps are larger.
+- `channel_timeline_<source>.png` puts all works of the same channel on the same row, so you can directly see cross-work ordering and idle gaps.
+- Channel utilization = `busy_cycles / channel_cycles` (from `channel_breakdown.csv`).
+- Channel waste = `channel_cycles - busy_cycles`.
+- `busy_cycles_sum` may be larger than `busy_cycles` if trace windows overlap; overlap amount is in `oversub_cycles`.
 - Across different GPUs/ranks, absolute clocks may not be globally synchronized; compare ordering and shape primarily within one source file.
 
 ## Notes and Limitations
