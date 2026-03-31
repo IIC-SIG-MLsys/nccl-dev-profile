@@ -1,170 +1,171 @@
 # Dev Primitive Profiler
 
-This document describes the in-tree device-side primitive profiler added for NCCL runtime debugging and performance analysis.
+这个 profiler 现在只围绕一件事：
 
-## What It Measures
+- 一次 NCCL 调用里，启动了哪些 TB
+- 每个 TB 生命周期多长
+- TB 里各个 primitive 占了多少时间
+- TB 有没有空闲
+- 空闲发生在什么位置，可能是在等什么
 
-The profiler records per-work (per channel work counter) timing on GPU and exports primitive-level breakdown:
+## 采集内容
 
-- TB lifecycle:
-  - `tbStart`: timestamp captured before running one work item in kernel
-  - `tbStop`: timestamp captured after that work item finishes
-- Primitive breakdown (inside `ProtoSimple` primitives):
-  - total cycles per primitive (`primCycles`)
-  - call count per primitive (`primCalls`)
+设备侧会记录：
 
-All timestamps/cycles come from GPU `globaltimer` ticks.
+- `tbStart` / `tbStop`
+- 每种 primitive 的总 cycles / calls
+- 每次 primitive 调用的 trace
+  - `trace_group`: 同一个 TB 里的 primitives group
+  - `trace_seq`: trace 顺序
+  - `trace_start` / `trace_stop`
 
-## Enable Profiling
+Host 侧落盘时还会带上：
 
-Set:
+- `op_count`: 这次 NCCL 调用的 id
+- `channel`
+- `work`
 
-```bash
-export NCCL_PRIM_PROFILE=1
-```
+所以现在可以从一个混合 CSV 里直接切出“某一次 NCCL 调用”。
 
-Optional (recommended for offline analysis):
+## CSV 格式
 
-```bash
-export NCCL_PRIM_PROFILE_FILE=/tmp/nccl_prim_profile.csv
-```
-
-Optional (console logs):
-
-```bash
-export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=PROFILE
-```
-
-## Run Example
-
-```bash
-NCCL_PRIM_PROFILE=1 \
-NCCL_PRIM_PROFILE_FILE=/tmp/nccl_prim_profile.csv \
-NCCL_DEBUG=INFO \
-NCCL_DEBUG_SUBSYS=PROFILE \
-./your_nccl_program
-```
-
-## Output Formats
-
-### 1) CSV file (`NCCL_PRIM_PROFILE_FILE`)
-
-When `NCCL_PRIM_PROFILE_FILE` is set, profiler appends CSV rows:
+`NCCL_PRIM_PROFILE_FILE` 输出列：
 
 ```text
-type,channel,work,tb_cycles,prim_cycles_total,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,stop_clk,trace_seq,trace_start,trace_stop,trace_dur,trace_start_off,trace_stop_off,trace_dropped
+type,op_count,channel,work,tb_cycles,prim_cycles_total,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,stop_clk,trace_group,trace_seq,trace_start,trace_stop,trace_dur,trace_start_off,trace_stop_off,trace_dropped
 ```
 
-Row types:
+含义：
 
-- `type=tb`: one summary row per work item
-- `type=prim`: one row per primitive with non-zero cycles for that work item
-- `type=trace`: one row per primitive invocation, preserving in-TB order and timing
+- `type=tb`: 一个 TB/work 的汇总
+- `type=prim`: 这个 TB 上某种 primitive 的累计时间
+- `type=trace`: 这个 TB 上一次 primitive 调用
 
-Column meanings:
+关键字段：
 
-- `channel`: channel id
-- `work`: work counter id
-- `tb_cycles`: `tbStop - tbStart`
-- `prim_cycles_total`: sum of all primitive cycles in this work item
-- `prim`: primitive name (`send`, `directRecvReduceDirectSend`, ...)
-- `cycles`: cycles consumed by this primitive
-- `calls`: number of calls for this primitive
-- `pct_tb`: `cycles / tb_cycles * 100`
-- `pct_prim_sum`: `cycles / prim_cycles_total * 100`
-- `start_clk`, `stop_clk`: raw GPU timer values
-- `trace_seq`: primitive call order within TB
-- `trace_start`, `trace_stop`: raw timer for one primitive call
-- `trace_dur`: `trace_stop - trace_start`
-- `trace_start_off`, `trace_stop_off`: offset from TB start clock
-- `trace_dropped`: number of trace events dropped because `NCCL_PRIM_TRACE_MAX_PER_WORK` was exceeded
+- `op_count`: 一次 NCCL 调用
+- `channel + work`: 一个 TB/work
+- `tb_cycles`: TB 整个生命周期
+- `prim_cycles_total`: TB 上所有 primitive 的总时间
+- `trace_group`: TB 内不同 primitives group
+- `trace_dropped`: trace 是否被截断
 
-### 2) NCCL profile logs
+## 分析脚本
 
-When `NCCL_DEBUG=INFO` and `NCCL_DEBUG_SUBSYS=PROFILE` are enabled, profiler also prints `PRIMPROF` lines with the same information.
+脚本：
 
-## Quick Analysis Examples
+- [tools/nccl_prim_profile_report.py](/Users/jacelau/code/opencode/nccl/tools/nccl_prim_profile_report.py)
 
-Use the built-in post-processing script:
+运行：
 
 ```bash
 python3 tools/nccl_prim_profile_report.py \
   --input /tmp/nccl_prim_profile_rank*.csv \
-  --outdir /tmp/nccl_prim_report
+  --outdir /tmp/nccl_prim_focus
 ```
 
-Outputs include:
-
-- `summary_global.txt`
-- `tb_breakdown.csv` (one row per TB/work item)
-- `tb_operator_rows.csv` (one row per TB+operator)
-- `tb_trace_rows.csv` (one row per primitive call; includes in-TB order and timing offsets)
-- `channel_breakdown.csv` (one row per `source+channel`, all works merged)
-- `channel_operator_rows.csv` (one row per `source+channel+operator`)
-- `summary_operators.csv`
-- `summary_channels.csv` (same content as `channel_breakdown.csv` for compatibility)
-- `summary_files.csv`
-- PNG plots (if `matplotlib` is installed):
-  - `tb_busy_ratio_hist.png`
-  - `channel_busy_waste_stacked.png`
-  - `channel_waste_pct.png`
-  - `channel_topk_waste_stacked.png`
-  - `operator_busy_contrib_topk.png`
-  - `channel_timeline_<source>.png` (each row is one channel, all works merged on one axis)
-
-Key TB-level columns in `tb_breakdown.csv`:
-
-- `tb_cycles`: full TB lifecycle cycles
-- `busy_cycles`: sum of primitive cycles on that TB
-- `waste_cycles`: `max(tb_cycles - busy_cycles, 0)`
-- `waste_pct`: waste ratio in TB lifecycle
-- `operators`: operators seen on this TB
-
-Channel-merged lifecycle columns (in `channel_breakdown.csv`):
-
-- `channel_cycles`: channel lifecycle span (`max(stop_clk)-min(start_clk)` over all works in that channel)
-- `busy_cycles`: union of trace durations on the channel timeline
-- `waste_cycles`: `max(channel_cycles - busy_cycles, 0)`
-- `work_count`: number of different `work` ids merged into this channel
-
-This makes it easy to inspect waste directly by channel:
+如果只看一个调用：
 
 ```bash
-{
-  head -n 1 /tmp/nccl_prim_report/channel_breakdown.csv
-  tail -n +2 /tmp/nccl_prim_report/channel_breakdown.csv | sort -t, -k12,12nr
-} | head
+python3 tools/nccl_prim_profile_report.py \
+  --input /tmp/nccl_prim_profile_rank*.csv \
+  --op-count 42 \
+  --outdir /tmp/nccl_prim_focus_call42
 ```
 
-Inspect primitive ordering on one channel timeline:
+如果不指定 `--op-count`，默认只分析 TB 数最多的那个调用。
 
-```bash
-# inspect one channel (all works mixed) ordered by absolute start time
-awk -F, '$3==0 {print $0}' /tmp/nccl_prim_report/tb_trace_rows.csv | sort -t, -k10,10n
-```
+## 输出文件
 
-Interpretation hints:
+每个调用一个目录，例如：`/tmp/nccl_prim_focus/op_42/`
 
-- `channel_timeline_<source>.png` puts all works of the same channel on the same row, so you can directly see cross-work ordering and idle gaps.
-- Channel utilization = `busy_cycles / channel_cycles` (from `channel_breakdown.csv`).
-- Channel waste = `channel_cycles - busy_cycles`.
-- `busy_cycles_sum` may be larger than `busy_cycles` if trace windows overlap; overlap amount is in `oversub_cycles`.
-- Across different GPUs/ranks, absolute clocks may not be globally synchronized; compare ordering and shape primarily within one source file.
+里面只有这几个文件：
 
-## Notes and Limitations
+- `call_summary.csv`
+  - 一行，就是这次 NCCL 调用的整体情况
+- `tb_summary.csv`
+  - 一行一个 TB/work
+  - 重点看：`tb_cycles`、`primitive_busy_cycles`、`idle_cycles`、`idle_pct`
+- `tb_primitives.csv`
+  - 一个 TB 上各 primitive 的累计时间分布
+- `tb_trace.csv`
+  - 一个 TB 上每次 primitive 调用的时序
+- `tb_gaps.csv`
+  - TB 生命周期里不在 primitive 内部的 gap
+  - 用来定位“空闲发生在什么位置”
+- `summary.txt`
+  - 直接给出最空闲的 TB 和最大的 gap
+- `tb_lifecycle_timeline_<source>_op<op_count>.png`
+  - 灰底是 TB 生命周期
+  - 彩条是 primitive trace
+  - 空白就是没有落在 primitive 内的 gap
 
-- Current instrumentation is in `prims_simple.h` (`ProtoSimple` path).
-- Data is collected from thread `0` per block to reduce profiling overhead.
-- Units are GPU timer ticks (not directly microseconds).
-- `MAX_PROFILER_EVENTS_PER_CHANNEL` ring size is 64; very heavy backlog can overwrite old slots.
-- For multi-process runs, use per-rank files to avoid inter-process append contention, for example:
-  - `/tmp/nccl_prim_profile_rank${RANK}.csv`
+## 怎么看
 
-## Related Source Files
+### 1. 先看整次调用
 
-- `src/include/device.h`
-- `src/device/common.h`
-- `src/device/prims_simple.h`
-- `src/transport/profiler.cc`
-- `src/plugin/profiler.cc`
+看 `call_summary.csv`：
+
+- `call_span_cycles`: 这次 NCCL 调用从最早 TB 开始到最晚 TB 结束的跨度
+- `tb_cycles_sum`: 所有 TB 生命周期求和
+- `primitive_busy_cycles_sum`: 所有 TB 上 primitive 时间求和
+- `idle_cycles_sum`: 所有 TB 上非-primitive 时间求和
+
+### 2. 找最空闲的 TB
+
+看 `tb_summary.csv`：
+
+- `idle_cycles = tb_cycles - primitive_busy_cycles`
+- `idle_pct` 越大，说明这个 TB 生命周期里非-primitive 部分越多
+- `largest_gap_cycles` 是这个 TB 上最大的空档
+- `largest_gap_reason` 是源码语义下的原因提示
+
+### 3. 看 primitive 分布
+
+看 `tb_primitives.csv`：
+
+- `pct_tb`: 某个 primitive 占这个 TB 生命周期的比例
+- `pct_prim_sum`: 某个 primitive 占所有 primitive 时间的比例
+
+### 4. 看空闲发生在什么位置
+
+看 `tb_gaps.csv`：
+
+- `before_first_primitive`
+  - 通常是 primitive setup、connector sync、pointer exchange、barrier
+- `between_primitives`
+  - 通常是 primitive 边界上的 bookkeeping / barrier / postPeer / 下一段 setup
+  - 真正的 peer/data wait 通常已经算在 primitive 里面了
+- `after_last_primitive`
+  - 通常是 teardown、final sync、析构等待、kernel epilogue
+
+如果 `trace_complete=0`，说明 trace 被截断了，gap 只能作为提示，不能当完整事实。
+
+### 5. 看图
+
+`tb_lifecycle_timeline_*.png`：
+
+- 每一行一个 TB：`chX/wY`
+- 灰色整条：TB 生命周期
+- 彩色块：primitive
+- 空白：非-primitive gap
+
+这是现在最核心的图。
+
+## 注意事项
+
+- 现在覆盖 `ProtoSimple` / `ProtoLL` / `ProtoLL128`
+- multi-group TB 已经支持，trace 里会带 `trace_group`
+- `NCCL_PRIM_TRACE_MAX_PER_WORK=1024`
+- 如果 `trace_dropped > 0`，说明这个 TB 的 trace 仍然不完整
+- GPU `globaltimer` 是 ticks，不是 us
+- 不同 rank/GPU 的绝对时钟不能直接横向对齐，优先看同一个 source 文件内的相对关系
+
+## 相关源码
+
+- [src/include/device.h](/Users/jacelau/code/opencode/nccl/src/include/device.h)
+- [src/device/common.h](/Users/jacelau/code/opencode/nccl/src/device/common.h)
+- [src/device/prims_simple.h](/Users/jacelau/code/opencode/nccl/src/device/prims_simple.h)
+- [src/device/prims_ll.h](/Users/jacelau/code/opencode/nccl/src/device/prims_ll.h)
+- [src/device/prims_ll128.h](/Users/jacelau/code/opencode/nccl/src/device/prims_ll128.h)
+- [src/transport/profiler.cc](/Users/jacelau/code/opencode/nccl/src/transport/profiler.cc)

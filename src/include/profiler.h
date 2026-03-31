@@ -19,10 +19,12 @@ struct ncclInfo;
 struct ncclComm;
 struct ncclProxyOp;
 struct ncclProxyConnector;
+struct ncclDevProfilerStart;
+struct ncclDevProfiler;
 
 struct ncclProfilerProxy {
   bool initialized;
-  struct ncclDevProfiler* workStarted/*[MAXCHANNELS]*/;
+  struct ncclDevProfilerStart* workStarted/*[MAXCHANNELS]*/;
   struct ncclDevProfiler* workCompleted/*[MAXCHANNELS]*/;
   uint64_t workCounter[MAXCHANNELS]; // host work counter
   struct ncclProxyConnector sendProxyConn[MAXCHANNELS];

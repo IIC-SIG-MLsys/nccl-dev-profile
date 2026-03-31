@@ -423,7 +423,11 @@ struct alignas(16) ncclDevChannel {
 };
 
 #define MAX_PROFILER_EVENTS_PER_CHANNEL 64
-#define NCCL_PRIM_TRACE_MAX_PER_WORK 64
+// 64 trace rows are not enough for large ring/simple works (for example ~480 primitive
+// invocations per work in an 8-rank allreduce). Keep workStarted lightweight and allow
+// workCompleted to retain a near-complete per-work timeline even when a work contains
+// multiple primitive groups.
+#define NCCL_PRIM_TRACE_MAX_PER_WORK 1024
 enum ncclPrimProfileKind : uint8_t {
   ncclPrimSend = 0,
   ncclPrimSendFromOutput,
@@ -455,11 +459,20 @@ enum ncclPrimProfileKind : uint8_t {
 
 struct ncclDevPrimTraceEvent {
   uint8_t kind;
-  uint8_t reserved0;
-  uint16_t reserved1;
+  uint8_t group;
+  uint16_t reserved0;
   uint32_t seq;
   uint64_t start;
   uint64_t stop;
+};
+
+struct ncclDevProfilerStartRecord {
+  uint64_t counter;
+  uint64_t timestamp;
+};
+
+struct ncclDevProfilerStart {
+  struct ncclDevProfilerStartRecord data[MAX_PROFILER_EVENTS_PER_CHANNEL];
 };
 
 struct ncclDevProfilerRecord {
@@ -497,7 +510,7 @@ struct ncclKernelComm {
   int* rankToLocalRank;
 
   // Profiler counters
-  struct ncclDevProfiler* workStarted/*[MAXCHANNELS]*/;
+  struct ncclDevProfilerStart* workStarted/*[MAXCHANNELS]*/;
   struct ncclDevProfiler* workCompleted/*[MAXCHANNELS]*/;
 };
 

@@ -189,8 +189,7 @@ class Primitives<
     constexpr int DirectSend = 1 && Direct && DirectSend1;
     constexpr int Src = SrcBuf != -1;
     constexpr int Dst = DstBuf != -1;
-    uint64_t primStart = 0;
-    if (ncclShmem.profilerEnabled && tid == 0) primStart = globaltimer();
+    uint64_t primStart = ncclPrimProfileStart(tid == 0);
 
     nelem = nelem < 0 ? 0 : nelem;
     int sliceSize = stepSize*StepPerSlice;
@@ -320,7 +319,7 @@ class Primitives<
     }
     if (ncclShmem.profilerEnabled && tid == 0) {
       uint64_t primStop = globaltimer();
-      ncclPrimProfileAdd((enum ncclPrimProfileKind)PrimKind, primStart, primStop);
+      ncclPrimProfileAdd((enum ncclPrimProfileKind)PrimKind, (uint8_t)group, /*groupLeader=*/true, primStart, primStop);
     }
   }
 

@@ -409,27 +409,43 @@ public:
   }
 
   __device__ void send(intptr_t inpIx, int eltN) {
-    return GenericOp<0, 1, Input, -1>(inpIx, -1, eltN, false);
+    uint64_t primStart = ncclPrimProfileStart(tid == 0);
+    GenericOp<0, 1, Input, -1>(inpIx, -1, eltN, false);
+    if (tid == 0) ncclPrimProfileAdd(ncclPrimSend, (uint8_t)group, true, primStart, globaltimer());
   }
   __device__ void sendFromOutput(intptr_t outIx, int eltN) {
-    return GenericOp<0, 1, Output, -1>(outIx, -1, eltN, false);
+    uint64_t primStart = ncclPrimProfileStart(tid == 0);
+    GenericOp<0, 1, Output, -1>(outIx, -1, eltN, false);
+    if (tid == 0) ncclPrimProfileAdd(ncclPrimSendFromOutput, (uint8_t)group, true, primStart, globaltimer());
   }
   __device__ void recv(intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<1, 0, -1, Output>(-1, outIx, eltN, postOp);
+    uint64_t primStart = ncclPrimProfileStart(tid == 0);
+    GenericOp<1, 0, -1, Output>(-1, outIx, eltN, postOp);
+    if (tid == 0) ncclPrimProfileAdd(ncclPrimRecv, (uint8_t)group, true, primStart, globaltimer());
   }
   __device__ void recvReduceSend(intptr_t inpIx, int eltN) {
-    return GenericOp<1, 1, Input, -1>(inpIx, -1, eltN, false);
+    uint64_t primStart = ncclPrimProfileStart(tid == 0);
+    GenericOp<1, 1, Input, -1>(inpIx, -1, eltN, false);
+    if (tid == 0) ncclPrimProfileAdd(ncclPrimRecvReduceSend, (uint8_t)group, true, primStart, globaltimer());
   }
   __device__ void recvReduceCopy(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<1, 0, Input, Output>(inpIx, outIx, eltN, postOp);
+    uint64_t primStart = ncclPrimProfileStart(tid == 0);
+    GenericOp<1, 0, Input, Output>(inpIx, outIx, eltN, postOp);
+    if (tid == 0) ncclPrimProfileAdd(ncclPrimRecvReduceCopy, (uint8_t)group, true, primStart, globaltimer());
   }
   __device__ void copySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<0, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    uint64_t primStart = ncclPrimProfileStart(tid == 0);
+    GenericOp<0, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    if (tid == 0) ncclPrimProfileAdd(ncclPrimCopySend, (uint8_t)group, true, primStart, globaltimer());
   }
   __device__ void recvCopySend(intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<1, 1, -1, Output>(-1, outIx, eltN, postOp);
+    uint64_t primStart = ncclPrimProfileStart(tid == 0);
+    GenericOp<1, 1, -1, Output>(-1, outIx, eltN, postOp);
+    if (tid == 0) ncclPrimProfileAdd(ncclPrimRecvCopySend, (uint8_t)group, true, primStart, globaltimer());
   }
   __device__ void recvReduceCopySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
-    return GenericOp<1, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    uint64_t primStart = ncclPrimProfileStart(tid == 0);
+    GenericOp<1, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+    if (tid == 0) ncclPrimProfileAdd(ncclPrimRecvReduceCopySend, (uint8_t)group, true, primStart, globaltimer());
   }
 };

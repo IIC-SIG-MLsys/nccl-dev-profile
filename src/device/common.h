@@ -256,24 +256,27 @@ __device__ __forceinline__ struct ncclDevProfilerRecord* ncclDevProfilerRecordAt
   return &ncclShmem.comm.workCompleted[ncclShmem.channelId].data[workCounter % MAX_PROFILER_EVENTS_PER_CHANNEL];
 }
 
-__device__ __forceinline__ void ncclPrimProfileAdd(enum ncclPrimProfileKind kind, uint64_t start, uint64_t stop) {
-  if (!ncclShmem.profilerEnabled || threadIdx.x != 0) return;
+__device__ __forceinline__ uint64_t ncclPrimProfileStart(bool groupLeader) {
+  return (ncclShmem.profilerEnabled && groupLeader) ? globaltimer() : 0;
+}
+
+__device__ __forceinline__ void ncclPrimProfileAdd(enum ncclPrimProfileKind kind, uint8_t group, bool groupLeader, uint64_t start, uint64_t stop) {
+  if (!ncclShmem.profilerEnabled || !groupLeader) return;
   if (stop <= start) return;
   struct ncclDevProfilerRecord* rec = ncclDevProfilerRecordAt(ncclShmem.workCounter);
   uint64_t cycles = stop - start;
-  rec->primCycles[kind] += cycles;
-  rec->primCalls[kind] += 1;
-  uint32_t idx = rec->primTraceCount;
+  atomicAdd(reinterpret_cast<unsigned long long*>(rec->primCycles + kind), static_cast<unsigned long long>(cycles));
+  atomicAdd(rec->primCalls + kind, 1u);
+  uint32_t idx = atomicAdd(&rec->primTraceCount, 1u);
   if (idx < NCCL_PRIM_TRACE_MAX_PER_WORK) {
     rec->primTrace[idx].kind = (uint8_t)kind;
+    rec->primTrace[idx].group = group;
     rec->primTrace[idx].reserved0 = 0;
-    rec->primTrace[idx].reserved1 = 0;
     rec->primTrace[idx].seq = idx;
     rec->primTrace[idx].start = start;
     rec->primTrace[idx].stop = stop;
-    rec->primTraceCount = idx + 1;
   } else {
-    rec->primTraceDropped += 1;
+    atomicAdd(&rec->primTraceDropped, 1u);
   }
 }
 
