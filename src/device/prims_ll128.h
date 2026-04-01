@@ -58,11 +58,13 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
 
   inline __device__ void waitSend(int nbytes) {
     if (sendConnHeadPtr) {
+      uint64_t waitStart = ncclTbStageProfileStart(tid == 0);
       int spins = 0;
       while (sendConnHeadCache + NCCL_STEPS < sendConnHead + 1) {
         sendConnHeadCache = *sendConnHeadPtr;
         if (checkAbort(abort, 1, spins)) break;
       }
+      ncclTbStageProfileAdd(ncclTbStageWait, tid == 0, waitStart, globaltimer());
       if (sendConnFifo) {
         sendConnFifo[sendStep[wid]%NCCL_STEPS].size = nbytes;
       }
@@ -185,6 +187,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
       uint64_t* ptr = recvPtr(0)+ll128Offset;
       uint64_t flag = recvFlag(0);
       bool needReload;
+      uint64_t waitStart = ncclTbStageProfileStart(tid == 0);
       int spins = 0;
       do {
         needReload = false;
@@ -193,8 +196,9 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
           load128(ptr+u*WARP_SIZE, vr[u], vr[u+1]);
           needReload |= flagThread && (vr[u+1] != flag);
         }
-        needReload &= (0 == checkAbort(abort, 1, spins));
+          needReload &= (0 == checkAbort(abort, 1, spins));
       } while (__any_sync(WARP_MASK, needReload));
+      ncclTbStageProfileAdd(ncclTbStageWait, tid == 0, waitStart, globaltimer());
 
       #pragma unroll
       for (int u=0; u<ELEMS_PER_THREAD; u+=2)
@@ -232,6 +236,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
         uint64_t flag = recvFlag(i);
         uint64_t* ptr = recvPtr(i)+ll128Offset;
         bool needReload;
+        uint64_t waitStart = ncclTbStageProfileStart(tid == 0);
         int spins = 0;
         do {
           needReload = false;
@@ -242,6 +247,7 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
           }
           needReload &= (0 == checkAbort(abort, 1, spins));
         } while (__any_sync(WARP_MASK, needReload));
+        ncclTbStageProfileAdd(ncclTbStageWait, tid == 0, waitStart, globaltimer());
 
         #pragma unroll
         for (int u=0; u<ELEMS_PER_THREAD; u+=2)
@@ -300,7 +306,9 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
     nelem = nelem < 0 ? 0 : nelem;
 
     if (SEND) waitSend(divUp(nelem, DataEltPerSlice)*WireWordPerSlice*sizeof(uint64_t));
+    uint64_t syncStart = ncclTbStageProfileStart(tid == 0);
     barrier();
+    ncclTbStageProfileAdd(ncclTbStageSync, tid == 0, syncStart, globaltimer());
     nelem -= DataEltPerSlice*warp;
     srcPtr += DataEltPerSlice*warp;
     dstPtr += DataEltPerSlice*warp;
@@ -317,11 +325,13 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL128, P2p, isNetOffload>:
       nelem -= DataEltPerSlice*nwarps;
     }
 
+    syncStart = ncclTbStageProfileStart(tid == 0);
     barrier();
     if (SEND) for (int i=0; i < MaxSend; i++) sendStep[i] += 1;
     if (SEND) postSend();
     if (RECV) for (int i=0; i < MaxRecv; i++) recvStep[i] += 1;
     if (RECV) postRecv();
+    ncclTbStageProfileAdd(ncclTbStageSync, tid == 0, syncStart, globaltimer());
   }
 
   __device__ __forceinline__ void loadRecvConn(struct ncclConnInfo* conn, int i) {

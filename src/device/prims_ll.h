@@ -56,26 +56,32 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
 
   inline __device__ void waitSend(int nbytes) {
     if (sendConnHeadPtr) {
+      uint64_t waitStart = ncclTbStageProfileStart(tid == 0);
       int spins = 0;
       while (sendConnHeadCache + NCCL_STEPS < sendConnHead + 1) {
         sendConnHeadCache = *sendConnHeadPtr;
         if (checkAbort(abort, 1, spins)) break;
       }
+      ncclTbStageProfileAdd(ncclTbStageWait, tid == 0, waitStart, globaltimer());
       if (sendConnFifo) {
         int size = ((sendConnHead & NCCL_LL_CLEAN_MASK) == NCCL_LL_CLEAN_MASK) ? stepLines*sizeof(union ncclLLFifoLine) : nbytes;
         sendConnFifo[sendConnHead%NCCL_STEPS].size = size;
       }
       sendConnHead += 1;
     }
+    uint64_t syncStart = ncclTbStageProfileStart(tid == 0);
     barrier();
+    ncclTbStageProfileAdd(ncclTbStageSync, tid == 0, syncStart, globaltimer());
   }
 
   inline __device__ void incRecv(int i) {
     recvStep[i] += 1;
   }
   inline __device__ void postRecv() {
+    uint64_t syncStart = ncclTbStageProfileStart(tid == 0);
     barrier();
     if (recvConnHeadPtr) *recvConnHeadPtr = recvConnHead += 1;
+    ncclTbStageProfileAdd(ncclTbStageSync, tid == 0, syncStart, globaltimer());
   }
 
   inline __device__ void incSend(int i, int offset) {
@@ -91,11 +97,13 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
     union ncclLLFifoLine* src = recvPtr(i) + offset;
     uint32_t flag = recvFlag(i);
     uint32_t data1, flag1, data2, flag2;
+    uint64_t waitStart = ncclTbStageProfileStart(tid == 0);
     int spins = 0;
     do {
       asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(data1), "=r"(flag1), "=r"(data2), "=r"(flag2) : "l"(&src->i4) : "memory");
       if (checkAbort(abort, 1, spins)) break;
     } while ((flag1 != flag) || (flag2 != flag));
+    ncclTbStageProfileAdd(ncclTbStageWait, tid == 0, waitStart, globaltimer());
     uint64_t val64 = data1 + (((uint64_t)data2) << 32);
     return val64;
   }
@@ -115,11 +123,13 @@ class Primitives<T, RedOp, Fan, Direct, ProtoLL, P2p, isNetOffload>:
   __device__ uint64_t readLLFinish(int offset, ncclLLFifoLine(&line)[MaxRecv], int i) {
     union ncclLLFifoLine* src = recvPtr(i) + offset;
     uint32_t flag = recvFlag(i);
+    uint64_t waitStart = ncclTbStageProfileStart(tid == 0);
     int spins = 0;
     while (line[i].flag1 != flag || line[i].flag2 != flag) {
       asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(line[i].data1), "=r"(line[i].flag1), "=r"(line[i].data2), "=r"(line[i].flag2) : "l"(&src->i4) : "memory");
       if (checkAbort(abort, 1, spins)) break;
     }
+    ncclTbStageProfileAdd(ncclTbStageWait, tid == 0, waitStart, globaltimer());
     uint64_t val64 = line[i].data1 + (((uint64_t)line[i].data2) << 32);
     return val64;
   }

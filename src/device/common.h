@@ -260,6 +260,18 @@ __device__ __forceinline__ uint64_t ncclPrimProfileStart(bool groupLeader) {
   return (ncclShmem.profilerEnabled && groupLeader) ? globaltimer() : 0;
 }
 
+__device__ __forceinline__ uint64_t ncclTbStageProfileStart(bool groupLeader) {
+  return (ncclShmem.profilerEnabled && groupLeader) ? globaltimer() : 0;
+}
+
+__device__ __forceinline__ void ncclTbStageProfileAdd(enum ncclTbStageKind kind, bool groupLeader, uint64_t start, uint64_t stop) {
+  if (!ncclShmem.profilerEnabled || !groupLeader) return;
+  if (stop <= start) return;
+  struct ncclDevProfilerRecord* rec = ncclDevProfilerRecordAt(ncclShmem.workCounter);
+  uint64_t cycles = stop - start;
+  atomicAdd(reinterpret_cast<unsigned long long*>(rec->stageCycles + kind), static_cast<unsigned long long>(cycles));
+}
+
 __device__ __forceinline__ void ncclPrimProfileAdd(enum ncclPrimProfileKind kind, uint8_t group, bool groupLeader, uint64_t start, uint64_t stop) {
   if (!ncclShmem.profilerEnabled || !groupLeader) return;
   if (stop <= start) return;
@@ -336,6 +348,10 @@ struct RunWorkBatch {
           rec->tbStop = 0;
           rec->primTraceCount = 0;
           rec->primTraceDropped = 0;
+          #pragma unroll
+          for (int s = 0; s < ncclTbStageN; s++) {
+            rec->stageCycles[s] = 0;
+          }
           #pragma unroll
           for (int p = 0; p < ncclPrimN; p++) {
             rec->primCycles[p] = 0;

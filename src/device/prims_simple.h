@@ -235,17 +235,26 @@ class Primitives<
           if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
           if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
         }
+        uint64_t waitStart = ncclTbStageProfileStart(tid == 0);
         waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
+        ncclTbStageProfileAdd(ncclTbStageWait, tid == 0, waitStart, globaltimer());
+        uint64_t syncStart = ncclTbStageProfileStart(tid == 0);
         subBarrier();
+        ncclTbStageProfileAdd(ncclTbStageSync, tid == 0, syncStart, globaltimer());
         /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
          * to 0 to avoid unnecessary workload. */
         int workSize = ncclShmem.aborted ? 0 : sliceSize;
         if (flags & AnyNetDeviceUnpack) {
+          uint64_t computeStart = ncclTbStageProfileStart(tid == 0);
           ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
+          ncclTbStageProfileAdd(ncclTbStageCompute, tid == 0, computeStart, globaltimer());
           // Sync here to make sure all workers are reading from the updated srcs)
+          syncStart = ncclTbStageProfileStart(tid == 0);
           subBarrier();
+          ncclTbStageProfileAdd(ncclTbStageSync, tid == 0, syncStart, globaltimer());
         }
 
+        uint64_t computeStart = ncclTbStageProfileStart(tid == 0);
         if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
             /* NVLS can have srcs[0] == dsts[0], but we cannot enter this "if branch",
              * so we need to check whether MultimemSrcs and MultimemDsts are 0. */
@@ -291,8 +300,11 @@ class Primitives<
           // skip data flush.
           workSize = 0;
         }
+        ncclTbStageProfileAdd(ncclTbStageCompute, tid == 0, computeStart, globaltimer());
+        syncStart = ncclTbStageProfileStart(tid == 0);
         barrier(); // This barrier has a counterpart in following loop
         postPeer<Recv, Send>(0 < workSize);
+        ncclTbStageProfileAdd(ncclTbStageSync, tid == 0, syncStart, globaltimer());
         offset += sliceSize;
         slice += 1;
         // Yes, for some template arguments this code will be unreachable.  That's fine.
@@ -309,11 +321,15 @@ class Primitives<
       sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
       { // Only workers could have Wait roles so we know the slice must be empty
         // since we've exited the loop above.
+        uint64_t waitStart = ncclTbStageProfileStart(tid == 0);
         waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(0, 0, 0, sliceSize);
+        ncclTbStageProfileAdd(ncclTbStageWait, tid == 0, waitStart, globaltimer());
       }
+      uint64_t syncStart = ncclTbStageProfileStart(tid == 0);
       barrier(); // Has couterpart in preceding worker-only loop.
       int workSize = ncclShmem.aborted ? 0 : sliceSize;
       postPeer<Recv, Send>(0 < workSize);
+      ncclTbStageProfileAdd(ncclTbStageSync, tid == 0, syncStart, globaltimer());
       offset += sliceSize;
       slice += 1;
     }

@@ -7,9 +7,10 @@ Goal:
 - Keep outputs minimal and directly useful for diagnosing where time is spent.
 
 Supported CSV columns:
-  type,op_count,channel,work,tb_cycles,prim_cycles_total,prim,cycles,calls,
-  pct_tb,pct_prim_sum,start_clk,stop_clk,trace_group,trace_seq,trace_start,
-  trace_stop,trace_dur,trace_start_off,trace_stop_off,trace_dropped
+  type,op_count,channel,work,tb_cycles,prim_cycles_total,wait_cycles,
+  compute_cycles,sync_cycles,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,
+  stop_clk,trace_group,trace_seq,trace_start,trace_stop,trace_dur,
+  trace_start_off,trace_stop_off,trace_dropped
 
 Legacy CSVs without `op_count` / `trace_group` are also supported.
 """
@@ -53,6 +54,9 @@ class TBRecord:
     work: int
     tb_cycles: int = 0
     prim_cycles_total: int = 0
+    wait_cycles: int = 0
+    compute_cycles: int = 0
+    sync_cycles: int = 0
     start_clk: int = 0
     stop_clk: int = 0
     trace_dropped: int = 0
@@ -64,6 +68,15 @@ class TBRecord:
         if self.prim_cycles_total > 0:
             return self.prim_cycles_total
         return sum(p.cycles for p in self.prims.values())
+
+    @property
+    def compute_cycles_derived(self) -> int:
+        if self.busy_cycles <= 0:
+            return 0
+        classified = self.wait_cycles + self.sync_cycles
+        if self.compute_cycles > 0:
+            return max(self.compute_cycles, self.busy_cycles - classified)
+        return max(self.busy_cycles - classified, 0)
 
     @property
     def idle_cycles(self) -> int:
@@ -164,6 +177,9 @@ def load_records(files: List[str], op_filter: Optional[set[int]]) -> Dict[Tuple[
 
                 rec.tb_cycles = max(rec.tb_cycles, _to_int(row.get("tb_cycles", "0")))
                 rec.prim_cycles_total = max(rec.prim_cycles_total, _to_int(row.get("prim_cycles_total", "0")))
+                rec.wait_cycles = max(rec.wait_cycles, _to_int(row.get("wait_cycles", "0")))
+                rec.compute_cycles = max(rec.compute_cycles, _to_int(row.get("compute_cycles", "0")))
+                rec.sync_cycles = max(rec.sync_cycles, _to_int(row.get("sync_cycles", "0")))
                 rec.trace_dropped = max(rec.trace_dropped, _to_int(row.get("trace_dropped", "0")))
 
                 start_clk = _to_int(row.get("start_clk", "0"))
@@ -306,6 +322,19 @@ def compute_gaps(rec: TBRecord) -> List[GapEvent]:
     return [g for g in gaps if g.dur > 0]
 
 
+def classify_tb_wait(rec: TBRecord, gaps: List[GapEvent]) -> str:
+    largest_gap = max(gaps, key=lambda x: x.dur, default=None)
+    if rec.wait_cycles >= max(rec.sync_cycles, rec.compute_cycles_derived, rec.idle_cycles) and rec.wait_cycles > 0:
+        return "inside primitive wait: waiting for peer data, recv flags, or downstream FIFO credit"
+    if rec.idle_cycles >= max(rec.wait_cycles, rec.sync_cycles, rec.compute_cycles_derived) and largest_gap is not None:
+        return f"outside primitive gap: {largest_gap.reason_hint}"
+    if rec.sync_cycles >= max(rec.wait_cycles, rec.compute_cycles_derived, rec.idle_cycles) and rec.sync_cycles > 0:
+        return "inside primitive sync: barrier, postPeer/postSend/postRecv, fence, or step bookkeeping"
+    if rec.compute_cycles_derived > 0:
+        return "mostly compute/copy inside primitive"
+    return "no dominant cause identified"
+
+
 def build_rows(records: List[TBRecord]) -> Tuple[List[dict], List[dict], List[dict], List[dict], dict]:
     if not records:
         return [], [], [], [], {}
@@ -320,6 +349,9 @@ def build_rows(records: List[TBRecord]) -> Tuple[List[dict], List[dict], List[di
     call_span = max(call_stop - call_start, 0)
     total_tb_cycles = 0
     total_busy_cycles = 0
+    total_wait_cycles = 0
+    total_compute_cycles = 0
+    total_sync_cycles = 0
     total_idle_cycles = 0
     total_trace_dropped = 0
     prim_totals: Dict[str, int] = defaultdict(int)
@@ -331,6 +363,7 @@ def build_rows(records: List[TBRecord]) -> Tuple[List[dict], List[dict], List[di
         if gaps:
             g = max(gaps, key=lambda x: x.dur)
             largest_gap_reason = g.reason_hint
+        dominant_reason = classify_tb_wait(rec, gaps)
 
         tb_rows.append(
             {
@@ -343,19 +376,32 @@ def build_rows(records: List[TBRecord]) -> Tuple[List[dict], List[dict], List[di
                 "tb_stop_clk": rec.stop_clk,
                 "tb_cycles": rec.tb_cycles,
                 "primitive_busy_cycles": rec.busy_cycles,
+                "wait_cycles": rec.wait_cycles,
+                "compute_cycles": rec.compute_cycles_derived,
+                "sync_cycles": rec.sync_cycles,
                 "idle_cycles": rec.idle_cycles,
+                "wait_pct_tb": (100.0 * rec.wait_cycles / rec.tb_cycles) if rec.tb_cycles else 0.0,
+                "compute_pct_tb": (100.0 * rec.compute_cycles_derived / rec.tb_cycles) if rec.tb_cycles else 0.0,
+                "sync_pct_tb": (100.0 * rec.sync_cycles / rec.tb_cycles) if rec.tb_cycles else 0.0,
                 "busy_pct": rec.busy_pct,
                 "idle_pct": rec.idle_pct,
+                "wait_pct_prim": (100.0 * rec.wait_cycles / rec.busy_cycles) if rec.busy_cycles else 0.0,
+                "compute_pct_prim": (100.0 * rec.compute_cycles_derived / rec.busy_cycles) if rec.busy_cycles else 0.0,
+                "sync_pct_prim": (100.0 * rec.sync_cycles / rec.busy_cycles) if rec.busy_cycles else 0.0,
                 "trace_count": len(rec.traces),
                 "trace_dropped": rec.trace_dropped,
                 "trace_complete": 1 if rec.trace_complete else 0,
                 "largest_gap_cycles": largest_gap,
                 "largest_gap_reason": largest_gap_reason,
+                "dominant_wait_reason": dominant_reason,
             }
         )
 
         total_tb_cycles += rec.tb_cycles
         total_busy_cycles += rec.busy_cycles
+        total_wait_cycles += rec.wait_cycles
+        total_compute_cycles += rec.compute_cycles_derived
+        total_sync_cycles += rec.sync_cycles
         total_idle_cycles += rec.idle_cycles
         total_trace_dropped += rec.trace_dropped
 
@@ -425,8 +471,14 @@ def build_rows(records: List[TBRecord]) -> Tuple[List[dict], List[dict], List[di
         "call_span_cycles": call_span,
         "tb_cycles_sum": total_tb_cycles,
         "primitive_busy_cycles_sum": total_busy_cycles,
+        "wait_cycles_sum": total_wait_cycles,
+        "compute_cycles_sum": total_compute_cycles,
+        "sync_cycles_sum": total_sync_cycles,
         "idle_cycles_sum": total_idle_cycles,
         "busy_pct_vs_tb_sum": (100.0 * total_busy_cycles / total_tb_cycles) if total_tb_cycles else 0.0,
+        "wait_pct_vs_tb_sum": (100.0 * total_wait_cycles / total_tb_cycles) if total_tb_cycles else 0.0,
+        "compute_pct_vs_tb_sum": (100.0 * total_compute_cycles / total_tb_cycles) if total_tb_cycles else 0.0,
+        "sync_pct_vs_tb_sum": (100.0 * total_sync_cycles / total_tb_cycles) if total_tb_cycles else 0.0,
         "idle_pct_vs_tb_sum": (100.0 * total_idle_cycles / total_tb_cycles) if total_tb_cycles else 0.0,
         "trace_dropped_sum": total_trace_dropped,
         "top_primitives": "|".join(p for p, _ in sorted(prim_totals.items(), key=lambda kv: kv[1], reverse=True)[:8]),
@@ -504,6 +556,7 @@ def plot_call_timeline(outdir: str, summary: dict, records: List[TBRecord]) -> N
 
 def write_summary_text(path: str, summary: dict, tb_rows: List[dict], gap_rows: List[dict]) -> None:
     worst_tb = max(tb_rows, key=lambda x: x["idle_cycles"], default=None)
+    worst_wait_tb = max(tb_rows, key=lambda x: x["wait_cycles"], default=None)
     worst_gap = max(gap_rows, key=lambda x: x["gap_cycles"], default=None)
     with open(path, "w") as f:
         for key, value in summary.items():
@@ -512,6 +565,10 @@ def write_summary_text(path: str, summary: dict, tb_rows: List[dict], gap_rows: 
             f.write("\nworst_tb_by_idle:\n")
             for key in ["channel", "work", "tb_cycles", "primitive_busy_cycles", "idle_cycles", "idle_pct", "largest_gap_cycles", "largest_gap_reason", "trace_complete", "trace_dropped"]:
                 f.write(f"{key}: {worst_tb.get(key)}\n")
+        if worst_wait_tb is not None:
+            f.write("\nworst_tb_by_internal_wait:\n")
+            for key in ["channel", "work", "tb_cycles", "primitive_busy_cycles", "wait_cycles", "wait_pct_tb", "wait_pct_prim", "sync_cycles", "compute_cycles", "dominant_wait_reason", "trace_complete", "trace_dropped"]:
+                f.write(f"{key}: {worst_wait_tb.get(key)}\n")
         if worst_gap is not None:
             f.write("\nworst_gap:\n")
             for key in ["channel", "work", "gap_kind", "gap_cycles", "prev_primitive", "next_primitive", "trace_complete", "reason_hint"]:
@@ -558,8 +615,11 @@ def main() -> int:
             tb_rows,
             [
                 "source", "source_base", "op_count", "channel", "work", "tb_start_clk", "tb_stop_clk", "tb_cycles",
-                "primitive_busy_cycles", "idle_cycles", "busy_pct", "idle_pct", "trace_count", "trace_dropped",
-                "trace_complete", "largest_gap_cycles", "largest_gap_reason",
+                "primitive_busy_cycles", "wait_cycles", "compute_cycles", "sync_cycles", "idle_cycles",
+                "wait_pct_tb", "compute_pct_tb", "sync_pct_tb", "busy_pct", "idle_pct",
+                "wait_pct_prim", "compute_pct_prim", "sync_pct_prim",
+                "trace_count", "trace_dropped", "trace_complete",
+                "largest_gap_cycles", "largest_gap_reason", "dominant_wait_reason",
             ],
         )
         write_csv(
@@ -589,7 +649,9 @@ def main() -> int:
             [summary],
             [
                 "source", "source_base", "op_count", "channel_count", "tb_count", "call_start_clk", "call_stop_clk", "call_span_cycles",
-                "tb_cycles_sum", "primitive_busy_cycles_sum", "idle_cycles_sum", "busy_pct_vs_tb_sum", "idle_pct_vs_tb_sum", "trace_dropped_sum", "top_primitives",
+                "tb_cycles_sum", "primitive_busy_cycles_sum", "wait_cycles_sum", "compute_cycles_sum", "sync_cycles_sum", "idle_cycles_sum",
+                "busy_pct_vs_tb_sum", "wait_pct_vs_tb_sum", "compute_pct_vs_tb_sum", "sync_pct_vs_tb_sum", "idle_pct_vs_tb_sum",
+                "trace_dropped_sum", "top_primitives",
             ],
         )
         write_summary_text(os.path.join(call_dir, "summary.txt"), summary, tb_rows, gap_rows)
@@ -598,7 +660,11 @@ def main() -> int:
 
         print(f"[OK] op_count={op_count} -> {os.path.abspath(call_dir)}")
         print(f"[OK]   TBs={summary['tb_count']} channels={summary['channel_count']} call_span={summary['call_span_cycles']}")
-        print(f"[OK]   primitive_busy_sum={summary['primitive_busy_cycles_sum']} idle_sum={summary['idle_cycles_sum']}")
+        print(
+            f"[OK]   primitive_busy_sum={summary['primitive_busy_cycles_sum']} "
+            f"wait_sum={summary['wait_cycles_sum']} compute_sum={summary['compute_cycles_sum']} "
+            f"sync_sum={summary['sync_cycles_sum']} idle_sum={summary['idle_cycles_sum']}"
+        )
 
     return 0
 

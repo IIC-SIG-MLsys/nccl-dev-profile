@@ -428,6 +428,13 @@ struct alignas(16) ncclDevChannel {
 // workCompleted to retain a near-complete per-work timeline even when a work contains
 // multiple primitive groups.
 #define NCCL_PRIM_TRACE_MAX_PER_WORK 1024
+enum ncclTbStageKind : uint8_t {
+  ncclTbStageWait = 0,
+  ncclTbStageCompute,
+  ncclTbStageSync,
+  ncclTbStageN,
+};
+
 enum ncclPrimProfileKind : uint8_t {
   ncclPrimSend = 0,
   ncclPrimSendFromOutput,
@@ -480,6 +487,7 @@ struct ncclDevProfilerRecord {
   uint64_t timestamp;
   uint64_t tbStart;
   uint64_t tbStop;
+  uint64_t stageCycles[ncclTbStageN];
   uint64_t primCycles[ncclPrimN];
   uint32_t primCalls[ncclPrimN];
   uint32_t primTraceCount;

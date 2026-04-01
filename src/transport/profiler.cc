@@ -45,6 +45,12 @@ static std::mutex ncclPrimProfileFileMutex;
 static FILE* ncclPrimProfileFile = nullptr;
 static bool ncclPrimProfileFileInit = false;
 
+static const char* ncclTbStageName[ncclTbStageN] = {
+  "wait",
+  "compute",
+  "sync",
+};
+
 static FILE* ncclPrimProfileGetFile() {
   std::lock_guard<std::mutex> lock(ncclPrimProfileFileMutex);
   if (!ncclPrimProfileFileInit) {
@@ -58,7 +64,7 @@ static FILE* ncclPrimProfileGetFile() {
         fseek(ncclPrimProfileFile, 0, SEEK_END);
         long fileSize = ftell(ncclPrimProfileFile);
         if (fileSize == 0) {
-          fprintf(ncclPrimProfileFile, "type,op_count,channel,work,tb_cycles,prim_cycles_total,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,stop_clk,trace_group,trace_seq,trace_start,trace_stop,trace_dur,trace_start_off,trace_stop_off,trace_dropped\n");
+          fprintf(ncclPrimProfileFile, "type,op_count,channel,work,tb_cycles,prim_cycles_total,wait_cycles,compute_cycles,sync_cycles,prim,cycles,calls,pct_tb,pct_prim_sum,start_clk,stop_clk,trace_group,trace_seq,trace_start,trace_stop,trace_dur,trace_start_off,trace_stop_off,trace_dropped\n");
         }
         fflush(ncclPrimProfileFile);
       }
@@ -88,16 +94,25 @@ static inline void ncclProfilerLogPrimSummary(
   uint64_t tbCycles = stopClk - startClk;
   uint64_t primCyclesTotal = 0;
   for (int p = 0; p < ncclPrimN; p++) primCyclesTotal += stopRec->primCycles[p];
+  uint64_t waitCycles = stopRec->stageCycles[ncclTbStageWait];
+  uint64_t syncCycles = stopRec->stageCycles[ncclTbStageSync];
+  uint64_t computeCycles = stopRec->stageCycles[ncclTbStageCompute];
+  if (primCyclesTotal >= waitCycles + syncCycles) {
+    computeCycles = primCyclesTotal - waitCycles - syncCycles;
+  }
 
   INFO(NCCL_PROFILE,
-       "PRIMPROF op_count %llu channel %d work %llu tb_cycles %llu start_clk %llu stop_clk %llu prim_cycles_total %llu",
+       "PRIMPROF op_count %llu channel %d work %llu tb_cycles %llu start_clk %llu stop_clk %llu prim_cycles_total %llu wait_cycles %llu compute_cycles %llu sync_cycles %llu",
        (unsigned long long)args->opCount,
        sub->channelId,
        (unsigned long long)sub->base,
        (unsigned long long)tbCycles,
        (unsigned long long)startClk,
        (unsigned long long)stopClk,
-       (unsigned long long)primCyclesTotal);
+       (unsigned long long)primCyclesTotal,
+       (unsigned long long)waitCycles,
+       (unsigned long long)computeCycles,
+       (unsigned long long)syncCycles);
 
   FILE* f = ncclPrimProfileGetFile();
 
@@ -117,14 +132,30 @@ static inline void ncclProfilerLogPrimSummary(
          pctPrim);
 
   }
+  for (int s = 0; s < ncclTbStageN; s++) {
+    uint64_t stageCycles = (s == ncclTbStageCompute) ? computeCycles : stopRec->stageCycles[s];
+    if (stageCycles == 0) continue;
+    INFO(NCCL_PROFILE,
+         "PRIMPROF op_count %llu channel %d work %llu stage %s cycles %llu pct_tb %.2f pct_prim_sum %.2f",
+         (unsigned long long)args->opCount,
+         sub->channelId,
+         (unsigned long long)sub->base,
+         ncclTbStageName[s],
+         (unsigned long long)stageCycles,
+         100.0 * (double)stageCycles / (double)tbCycles,
+         (primCyclesTotal == 0) ? 0.0 : (100.0 * (double)stageCycles / (double)primCyclesTotal));
+  }
   if (f != nullptr) {
     std::lock_guard<std::mutex> lock(ncclPrimProfileFileMutex);
-    fprintf(f, "tb,%llu,%d,%llu,%llu,%llu,,0,0,0.00,0.00,%llu,%llu,,,,,,,,%u\n",
+    fprintf(f, "tb,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu,,0,0,0.00,0.00,%llu,%llu,,,,,,,,%u\n",
             (unsigned long long)args->opCount,
             sub->channelId,
             (unsigned long long)sub->base,
             (unsigned long long)tbCycles,
             (unsigned long long)primCyclesTotal,
+            (unsigned long long)waitCycles,
+            (unsigned long long)computeCycles,
+            (unsigned long long)syncCycles,
             (unsigned long long)startClk,
             (unsigned long long)stopClk,
             stopRec->primTraceDropped);
@@ -133,12 +164,15 @@ static inline void ncclProfilerLogPrimSummary(
       if (stopRec->primCycles[p] == 0) continue;
       double pctTb = 100.0 * (double)stopRec->primCycles[p] / (double)tbCycles;
       double pctPrim = (primCyclesTotal == 0) ? 0.0 : (100.0 * (double)stopRec->primCycles[p] / (double)primCyclesTotal);
-      fprintf(f, "prim,%llu,%d,%llu,%llu,%llu,%s,%llu,%u,%.6f,%.6f,%llu,%llu,,,,,,,,%u\n",
+      fprintf(f, "prim,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu,%s,%llu,%u,%.6f,%.6f,%llu,%llu,,,,,,,,%u\n",
               (unsigned long long)args->opCount,
               sub->channelId,
               (unsigned long long)sub->base,
               (unsigned long long)tbCycles,
               (unsigned long long)primCyclesTotal,
+              (unsigned long long)waitCycles,
+              (unsigned long long)computeCycles,
+              (unsigned long long)syncCycles,
               ncclPrimProfileName[p],
               (unsigned long long)stopRec->primCycles[p],
               stopRec->primCalls[p],
@@ -157,12 +191,15 @@ static inline void ncclProfilerLogPrimSummary(
       int64_t offStart = (int64_t)ev->start - (int64_t)startClk;
       int64_t offStop = (int64_t)ev->stop - (int64_t)startClk;
       double pctTb = 100.0 * (double)dur / (double)tbCycles;
-      fprintf(f, "trace,%llu,%d,%llu,%llu,%llu,%s,%llu,1,%.6f,0.000000,%llu,%llu,%u,%u,%llu,%llu,%llu,%lld,%lld,%u\n",
+      fprintf(f, "trace,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu,%s,%llu,1,%.6f,0.000000,%llu,%llu,%u,%u,%llu,%llu,%llu,%lld,%lld,%u\n",
               (unsigned long long)args->opCount,
               sub->channelId,
               (unsigned long long)sub->base,
               (unsigned long long)tbCycles,
               (unsigned long long)primCyclesTotal,
+              (unsigned long long)waitCycles,
+              (unsigned long long)computeCycles,
+              (unsigned long long)syncCycles,
               ncclPrimProfileName[ev->kind],
               (unsigned long long)dur,
               pctTb,
