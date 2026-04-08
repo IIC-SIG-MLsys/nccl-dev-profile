@@ -182,6 +182,7 @@ python3 tools/nccl_prim_profile_report.py \
 ## 注意事项
 
 - 现在覆盖 `ProtoSimple` / `ProtoLL` / `ProtoLL128`
+- `alltoall/sendrecv` (P2P) 在 profiling 开启时会切换到按 work 顺序的 profiling 模式，保证 prim/trace 可见（性能会比非 profiling 低）
 - multi-group TB 已经支持，trace 里会带 `trace_group`
 - `NCCL_PRIM_TRACE_MAX_PER_WORK=1024`
 - 如果 `trace_dropped > 0`，说明这个 TB 的 trace 仍然不完整
